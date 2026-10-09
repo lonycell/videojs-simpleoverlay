@@ -40,6 +40,7 @@ const state = {
   year: 1661, timeFocus: false, follow: true, playing: false,
   show: { family: true, union: true, event: true, relation: true, era: true },
   autoRotate: false,
+  orient: 'auto', // 시간 방향: auto(휴대폰 세로 화면은 세로) | h(가로, 왼쪽→오른쪽) | v(세로, 위→아래)
   route: null, // 경로만 보기: { ids, steps, ps:Set, pairs:Set, event }
 };
 
@@ -257,6 +258,23 @@ let beads, gems, lifelines, links, rings, pickLife, ticks, eraRings, cursor, axi
 // 휴대폰처럼 세로로 긴 화면에서는 시간 축을 세로로 세운다(위가 과거, 아래가 미래). 모든 장면 요소를 root에 담아 돌린다.
 let root, vertical = false;
 const toWorld = (v) => root.localToWorld(v.clone());
+const wantVertical = () => state.orient === 'v' || (state.orient === 'auto' && isNarrow() && window.innerHeight > window.innerWidth);
+// 시간 방향을 바꾼다. 보던 연도(카메라가 바라보는 곳)를 그대로 두고 축만 눕히거나 세운다.
+function applyOrient() {
+  const v = wantVertical();
+  if (v === vertical) return;
+  const local = toLocal(ctl.goal || ctl.target);
+  vertical = v;
+  root.rotation.z = v ? -Math.PI / 2 : 0;
+  root.updateMatrixWorld(true);
+  ctl.target.copy(toWorld(local));
+  ctl.goal = null;
+  if (v) { ctl.theta = 0.45; ctl.phi = 1.5; } else { ctl.theta = 0.5; ctl.phi = 1.18; }
+  if (state.route) fitRoute();
+  else { const y = local.x / YS + X0, span = !v && isNarrow() ? 22 : 45; fitRange(y - span, y + span); }
+  for (const L of labels) L.w = 0;
+  dirty = true;
+}
 const toLocal = (v) => root.worldToLocal(v.clone());
 const canvas = $('gl');
 const segs = []; // 연결선 토막 목록(링크별 시작·개수)
@@ -281,7 +299,7 @@ function initGL() {
   scene.add(dust);
   post = fx.makePost();
   root = new T.Group();
-  vertical = isNarrow() && window.innerHeight > window.innerWidth;
+  vertical = wantVertical();
   if (vertical) root.rotation.z = -Math.PI / 2;
   scene.add(root);
   root.updateMatrixWorld(true);
@@ -1039,6 +1057,7 @@ function resize() {
   camera.updateProjectionMatrix();
   post.setSize(w, h, renderer.getPixelRatio());
   for (const L of labels) L.w = 0;
+  if (state.orient === 'auto' && root) applyOrient(); // 휴대폰을 돌리면 방향도 따라 바뀐다
 }
 let last = performance.now(), clock = 0, playAcc = 0;
 function frame(now) {
@@ -1067,6 +1086,7 @@ function frame(now) {
 function main() {
   const sets = window.WORLD_DATASETS || [];
   if (!sets.length) throw new Error('세계사 데이터(data/world/*.js)를 불러오지 못했습니다');
+  try { const o = localStorage.getItem('genealogy.world.orient'); if (o === 'h' || o === 'v' || o === 'auto') state.orient = o; } catch (err) { /* 기본값 */ }
   if (!initGL()) return;
   const byId = new Map(sets.map((d) => [d.meta.id, d]));
   const data = byId.get(decodeURIComponent(location.hash.slice(1))) || sets[0];
@@ -1103,6 +1123,12 @@ function main() {
   $('timeFocus').addEventListener('change', (e) => { state.timeFocus = e.target.checked; dirty = true; });
   $('follow').checked = state.follow;
   $('follow').addEventListener('change', (e) => { state.follow = e.target.checked; });
+  $('orient').value = state.orient;
+  $('orient').addEventListener('change', (e) => {
+    state.orient = e.target.value;
+    try { localStorage.setItem('genealogy.world.orient', state.orient); } catch (err) { /* 저장 불가: 무시 */ }
+    applyOrient();
+  });
   $('autoRotate').checked = state.autoRotate;
   $('autoRotate').addEventListener('change', (e) => { state.autoRotate = e.target.checked; });
   $('toggleControls').addEventListener('click', () => {
@@ -1126,7 +1152,8 @@ function main() {
   ctl.target.copy(toWorld(new T.Vector3(xOf(S.b + 20), 0, 0)));
   ctl.radius = 420;
   if (vertical) { ctl.theta = 0.45; ctl.phi = 1.5; }
-  fitRange(S.b - 12, S.d + 8);
+  if (!vertical && isNarrow()) fitRange(1650, 1695); // 좁은 화면을 가로로 쓸 때는 한 세대쯤만
+  else fitRange(S.b - 12, S.d + 8);
   if (!isNarrow()) select({ kind: 'p', id: state.subject }, false);
   requestAnimationFrame(frame);
   window.__world = { state, ctl, select, setYear, setRoute, camera: () => camera, relationToSubject, pathFromSubject, routeTo };
