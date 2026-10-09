@@ -40,6 +40,7 @@ const state = {
   year: 1661, timeFocus: false, follow: true, playing: false,
   show: { family: true, union: true, event: true, relation: true, era: true },
   autoRotate: false,
+  route: null, // 경로만 보기: { ids, steps, ps:Set, pairs:Set, event }
 };
 
 // ── 데이터 준비 ────────────────────────────────────────
@@ -202,21 +203,52 @@ function relationToSubject(id) {
   return cands[0] || null;
 }
 // 혈연·혼인·관계를 모두 이어 중심 인물에서 그 사람까지의 가장 짧은 경로
-function pathFromSubject(id) {
+// 중심 인물에서 그 사람까지의 가장 짧은 길. 혈연(부모·자녀)을 가장 가깝게, 혼인을 그다음으로,
+// 그 밖의 관계(후원·경쟁 등)는 멀게 쳐서 가능하면 핏줄과 혼인으로 잇는다(데이크스트라).
+const STEP_COST = { parent: 1, child: 1, spouse: 1.2, liaison: 1.6, relation: 2.5 };
+function neighbors(id) {
+  const p = state.persons.get(id);
+  const out = [];
+  if (p.f) out.push({ id: p.f, kind: 'parent' });
+  if (p.m) out.push({ id: p.m, kind: 'parent' });
+  for (const k of p.kids) out.push({ id: k, kind: 'child' });
+  for (const sp of p.spouses) out.push({ id: sp.id, kind: sp.kind === 'l' ? 'liaison' : 'spouse' });
+  for (const r of p.rels) out.push({ id: r.id, kind: 'relation', type: r.type });
+  return out;
+}
+// 먼저 혈연·혼인만으로 찾고, 그 길이 없을 때만 그 밖의 관계(후원·경쟁 등)까지 넣어 찾는다.
+function routeTo(id) {
+  return routeSearch(id, true) || routeSearch(id, false);
+}
+function routeSearch(id, familyOnly) {
   const S = state.subject;
-  const prev = new Map([[S, null]]);
-  const q = [S];
-  while (q.length) {
-    const cur = q.shift();
-    if (cur === id) break;
-    const p = state.persons.get(cur);
-    const nb = [p.f, p.m, ...p.kids, ...p.spouses.map((s) => s.id), ...p.rels.map((r) => r.id)].filter(Boolean);
-    for (const n of nb) if (!prev.has(n)) { prev.set(n, cur); q.push(n); }
+  const dist = new Map([[S, 0]]), prev = new Map([[S, null]]), done = new Set();
+  while (true) {
+    let cur = null, best = Infinity;
+    for (const [k, d] of dist) if (!done.has(k) && d < best) { best = d; cur = k; }
+    if (cur === null || cur === id) break;
+    done.add(cur);
+    for (const n of neighbors(cur)) {
+      if (familyOnly && n.kind === 'relation') continue;
+      const nd = best + STEP_COST[n.kind];
+      if (nd < (dist.get(n.id) ?? Infinity)) { dist.set(n.id, nd); prev.set(n.id, { from: cur, step: n }); }
+    }
   }
   if (!prev.has(id)) return null;
-  const path = [];
-  for (let c = id; c; c = prev.get(c)) path.unshift(c);
-  return path;
+  const steps = [];
+  for (let c = id; prev.get(c); c = prev.get(c).from) steps.unshift({ from: prev.get(c).from, to: c, ...prev.get(c).step });
+  return { ids: [S, ...steps.map((st) => st.to)], steps, familyOnly };
+}
+function pathFromSubject(id) { const r = routeTo(id); return r ? r.ids : null; }
+// 한 걸음의 관계 이름(앞사람에게서 본 뒷사람)
+function stepWord(st) {
+  const to = state.persons.get(st.to);
+  const F = to.g === 'F';
+  if (st.kind === 'parent') return F ? '어머니' : '아버지';
+  if (st.kind === 'child') return F ? '딸' : '아들';
+  if (st.kind === 'spouse') return F ? '아내' : '남편';
+  if (st.kind === 'liaison') return '연인';
+  return REL_KO[st.type] || '관계';
 }
 
 // ── 3D 장면 ──────────────────────────────────────────────
@@ -229,6 +261,7 @@ const toLocal = (v) => root.worldToLocal(v.clone());
 const canvas = $('gl');
 const segs = []; // 연결선 토막 목록(링크별 시작·개수)
 let linkList = [];
+const baseM = {}; // 경로만 보기에서 숨겼다가 되돌릴 원래 배치 행렬
 let dirty = true;
 
 function initGL() {
@@ -348,6 +381,7 @@ function buildScene() {
     pickLife.setMatrixAt(i, _m);
   });
   beads.count = P.length;
+  baseM.beads = Float32Array.from(beads.instanceMatrix.array);
   root.add(beads, pickLife);
 
   // 사건: 수정 + 축을 감싸는 고리
@@ -367,6 +401,8 @@ function buildScene() {
     rings.geometry.attributes.aColor.setXYZ(i, c.r, c.g, c.b);
   });
   gems.count = E.length; rings.count = E.length;
+  baseM.gems = Float32Array.from(gems.instanceMatrix.array);
+  baseM.rings = Float32Array.from(rings.instanceMatrix.array);
   root.add(gems, rings);
 
   // 연결선 목록
@@ -441,6 +477,68 @@ function buildScene() {
   dirty = true;
 }
 
+// 경로만 보기에서 남길 선: 경로 인물의 생애선, 경로의 걸음(혈연·혼인·관계), 고른 사건과 그 참여선
+function routeLink(L) {
+  const R = state.route;
+  if (L.kind === 'life') return R.ps.has(L.a.id);
+  if (L.kind === 'duration') return L.a.id === R.event;
+  if (L.kind === 'event') return L.a.id === R.event && R.eventPeople.has(L.b.id);
+  return R.pairs.has(`${L.a.id}|${L.b.id}`) || R.pairs.has(`${L.b.id}|${L.a.id}`);
+}
+function routeFor(sel) {
+  if (!sel) return null;
+  let r, event = null, eventPeople = new Set();
+  if (sel.kind === 'p') r = routeTo(sel.id);
+  else {
+    // 사건: 참여자 가운데 중심 인물과 가장 가까운 사람까지의 길 + 사건과 그 참여자
+    const ev = state.events.get(sel.id);
+    event = ev.id;
+    for (const [pid] of ev.people) {
+      const c = routeTo(pid);
+      const better = c && (!r || (c.familyOnly && !r.familyOnly) || (c.familyOnly === r.familyOnly && c.steps.length < r.steps.length));
+      if (better) r = c;
+    }
+    if (r) eventPeople.add(r.ids[r.ids.length - 1]);
+  }
+  if (!r) return null;
+  const pairs = new Set(r.steps.map((st) => `${st.from}|${st.to}`));
+  return { ...r, ps: new Set(r.ids), pairs, event, eventPeople, target: sel };
+}
+function setRoute(on) {
+  state.route = on ? routeFor(state.selected) : null;
+  dirty = true;
+  renderRouteBar();
+  renderInfo();
+  if (state.route) fitRoute();
+}
+// 경로 전체가 화면에 들어오게 맞춘다.
+function fitRoute() {
+  const R = state.route;
+  const pts = R.ids.map((id) => state.persons.get(id).bead);
+  if (R.event) pts.push(state.events.get(R.event).pos);
+  const box = new T.Box3().setFromPoints(pts.map((v) => toWorld(v)));
+  const size = box.getSize(new T.Vector3());
+  const tanV = Math.tan((camera.fov * Math.PI) / 360);
+  ctl.goal = box.getCenter(new T.Vector3());
+  const w = Math.max(size.x, size.z) + 24, h = size.y + 24;
+  ctl.radiusGoal = Math.max(40, Math.max(h / 2 / tanV, w / 2 / (tanV * camera.aspect)) * 1.1);
+}
+function renderRouteBar() {
+  const bar = $('routeBar');
+  const R = state.route;
+  if (!R) { bar.hidden = true; document.body.classList.remove('route-on'); return; }
+  const parts = [chip('p', R.ids[0])];
+  for (const st of R.steps) parts.push(`<i>${esc(stepWord(st))}</i>${chip('p', st.to)}`);
+  if (R.event) parts.push(`<i>참여</i>${chip('e', R.event)}`);
+  const tgt = R.target.kind === 'p' ? state.persons.get(R.target.id).ko : state.events.get(R.target.id).ko;
+  const kind = R.familyOnly ? '혈연·혼인으로 이어진 길' : '혈연·혼인으로는 닿지 않아 그 밖의 관계를 거친 길';
+  bar.innerHTML = `<p><b>경로만 보기</b><span>${esc(state.persons.get(state.subject).ko)} → ${esc(tgt)} · ${R.steps.length}단계 · ${kind}</span></p>
+    <div class="route">${parts.join('')}</div>
+    <button type="button" class="glass-btn" data-act="route-off">모두 보기</button>`;
+  bar.hidden = false;
+  document.body.classList.add('route-on');
+}
+
 // 선택·연도 커서에 따라 밝기를 다시 정한다(바뀔 때만).
 function relatedSets() {
   const sel = state.selected;
@@ -462,13 +560,16 @@ function refresh() {
   const rel = relatedSets();
   const Y = state.year, tf = state.timeFocus;
   const hov = state.hovered;
+  const R = state.route;
   const pVis = (p) => {
+    if (R) return R.ps.has(p.id) ? 1 : 0.02;
     let v = 1;
     if (rel) v = rel.ps.has(p.id) ? 1 : 0.18;
     if (tf && !aliveAt(p, Y)) v *= 0.3;
     return v;
   };
   const eVis = (e) => {
+    if (R) return R.event === e.id ? 1 : 0.02;
     let v = 1;
     if (rel) v = rel.es.has(e.id) ? 1 : 0.15;
     if (tf && !(e.from - 1 <= Y && Y <= e.to + 1)) v *= 0.3;
@@ -498,9 +599,10 @@ function refresh() {
     const showK = L.kind === 'life' || L.kind === 'duration' ? true : L.kind === 'liaison' ? state.show.union : state.show[L.kind];
     const end = (x) => (!x ? 1 : x.k === 'p' ? state.persons.get(x.id).vis : state.events.get(x.id).vis);
     let v = showK ? Math.min(end(L.a), end(L.b)) : 0;
+    if (R) v = routeLink(L) ? 1 : 0;
     if (L.kind === 'duration' && !state.show.event) v = 0;
     let hot = 0;
-    if (state.selected && v > 0.9 && L.kind !== 'life') hot = 1;
+    if ((state.selected || R) && v > 0.9 && L.kind !== 'life') hot = 1;
     const base = { life: [0.7, 0.12, 0.3], family: [0.9, 0.35, 0.5], union: [0.9, 0.2, 0.4], liaison: [0.6, 0.2, 0.2], relation: [0.55, 0.25, 0.15], event: [0.6, 0.45, 0.3], duration: [1.0, 0.4, 0.8] }[L.kind];
     for (let k = 0; k < L.n; k++) {
       lp.setXYZW(L.start + k, base[0] * (0.4 + 0.6 * v), base[1], hot ? 1 : base[2], v * (L.kind === 'life' ? 0.9 : 1) * (hot ? 1.3 : 1));
@@ -508,6 +610,17 @@ function refresh() {
   }
   lp.needsUpdate = true;
   eraRings.visible = state.show.era;
+  // 경로만 보기: 경로 밖 구슬·수정·고리는 크기를 0으로 줄여 아예 숨긴다(유리 반사까지 사라지게).
+  const hideOut = (mesh, base, list, keep) => {
+    const arr = mesh.instanceMatrix.array;
+    arr.set(base);
+    if (R) for (const o of list) if (!keep(o)) arr.fill(0, o.index * 16, o.index * 16 + 15);
+    mesh.instanceMatrix.needsUpdate = true;
+  };
+  const PL = [...state.persons.values()], EL = [...state.events.values()];
+  hideOut(beads, baseM.beads, PL, (p) => R.ps.has(p.id));
+  hideOut(gems, baseM.gems, EL, (e) => R.event === e.id);
+  hideOut(rings, baseM.rings, EL, (e) => R.event === e.id);
   dirty = false;
 }
 
@@ -612,7 +725,7 @@ function setupControls() {
     else if (e.key === 'ArrowDown') ctl.vPhi = 0.05;
     else if (e.key === '+' || e.key === '=') ctl.radiusGoal *= 0.8;
     else if (e.key === '-') ctl.radiusGoal *= 1.25;
-    else if (e.key === 'Escape') select(null);
+    else if (e.key === 'Escape') { if (state.route) setRoute(false); else select(null); }
     else return;
     e.preventDefault(); ctl.idle = 0;
   });
@@ -666,6 +779,10 @@ function clickAt(x, y) {
 function select(sel, fly) {
   state.selected = sel;
   dirty = true;
+  // 경로만 보기 중에는 새로 고른 대상까지의 경로로 바꾼다(빈 곳을 누르면 그대로 둔다).
+  const onRoute = state.route && sel && (sel.kind === 'p' ? state.route.ps.has(sel.id) : state.route.event === sel.id);
+  if (state.route && sel && !onRoute) { state.route = routeFor(sel); renderRouteBar(); if (state.route) { renderInfo(); fitRoute(); return; } }
+  if (onRoute) fly = false;
   renderInfo();
   if (sel && fly) {
     if (sel.kind === 'p') { const p = state.persons.get(sel.id); flyTo(new T.Vector3(p.bead.x, p.y * 0.5, p.z * 0.5)); }
@@ -752,13 +869,16 @@ function updateLabels() {
   const items = [];
   for (const L of labels) {
     if (L.kind === 'era') { L.el.style.display = state.show.era ? '' : 'none'; if (!state.show.era) continue; }
-    if (L.kind === 'e' && !state.show.event) { L.el.style.opacity = '0'; continue; }
+    if (L.kind === 'e' && !state.show.event && !(state.route && state.route.event === L.obj.id)) { L.el.style.opacity = '0'; continue; }
+    if (state.route && (L.kind === 'p' || L.kind === 'e') && !(L.kind === 'p' ? state.route.ps.has(L.obj.id) : state.route.event === L.obj.id)) { L.el.style.opacity = '0'; continue; }
+    if (state.route && L.kind === 'g') { L.el.style.opacity = '0'; continue; }
     const dist = cam.distanceTo(vertical ? toWorld(L.pos) : L.pos);
     let pri = L.base;
     if (L.kind === 'p' || L.kind === 'e') {
       const id = L.obj.id, k = L.kind;
       if (hov && hov.kind === k && hov.id === id) pri = 300;
       else if (sel && sel.kind === k && sel.id === id) pri = 250;
+      else if (state.route) pri = 250; // 경로 인물은 몇 명뿐이라 겹쳐도 모두 보인다
       else if (rel && (k === 'p' ? rel.ps : rel.es).has(id)) pri += 80;
       if (state.timeFocus && L.kind === 'p' && aliveAt(L.obj, state.year)) pri += 40;
       if (state.timeFocus && L.kind === 'e' && L.obj.from - 1 <= state.year && state.year <= L.obj.to + 1) pri += 60;
@@ -801,6 +921,7 @@ function chip(kind, id, extra = '') {
   return `<button type="button" class="go" data-go="${kind}:${id}" style="--c:${c}">${esc(o.ko)}${extra ? `<small>${esc(extra)}</small>` : ''}</button>`;
 }
 const wikiUrl = (wiki, en) => wiki ? `https://en.wikipedia.org/wiki/${encodeURIComponent(wiki).replace(/%2F/g, '/')}` : `https://en.wikipedia.org/w/index.php?search=${encodeURIComponent(en)}`;
+const routeBtn = () => `<button type="button" class="glass-btn primary" data-act="route">${state.route ? '모두 보기' : `${esc(state.persons.get(state.subject).ko)}까지 경로만 보기`}</button>`;
 function renderInfo() {
   const box = $('info');
   const sel = state.selected;
@@ -828,7 +949,8 @@ function renderInfo() {
       ${path && path.length > 2 ? `<div class="path"><span>${esc(sub.ko)}에서 이어지는 길</span>${path.map((x) => chip('p', x)).join('<i>›</i>')}</div>` : ''}
       <dl class="fam">${fam}</dl>
       <div class="acts"><a class="glass-btn" href="${wikiUrl(p.wiki, p.en)}" target="_blank" rel="noopener">위키백과</a>
-        <button type="button" class="glass-btn" data-act="year" data-y="${Math.round((p.b + p.d) / 2)}">그 시대로</button></div>`;
+        <button type="button" class="glass-btn" data-act="year" data-y="${Math.round((p.b + p.d) / 2)}">그 시대로</button>
+        ${p.id !== state.subject ? routeBtn() : ''}</div>`;
   } else {
     const e = state.events.get(sel.id);
     const t = typeOf(e.type);
@@ -840,7 +962,8 @@ function renderInfo() {
       <p class="note">${esc(e.summary)}</p>
       <dl class="fam"><dt>관련 인물</dt><dd>${e.people.map(([pid, role]) => chip('p', pid, role)).join('')}</dd></dl>
       <div class="acts"><a class="glass-btn" href="${wikiUrl(e.wiki, e.en)}" target="_blank" rel="noopener">위키백과</a>
-        <button type="button" class="glass-btn" data-act="year" data-y="${e.from}">그 해로</button></div>`;
+        <button type="button" class="glass-btn" data-act="year" data-y="${e.from}">그 해로</button>
+        ${routeBtn()}</div>`;
   }
   box.innerHTML = `<button type="button" class="close" aria-label="닫기"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10.25"/><path d="M8.6 8.6l6.8 6.8M15.4 8.6l-6.8 6.8"/></svg></button>${html}`;
   if (box.hidden) box._openedAt = performance.now();
@@ -854,6 +977,7 @@ function setupInfo() {
     const go = ev.target.closest('[data-go]');
     if (go) { haptic(8); const [k, id] = go.dataset.go.split(':'); select({ kind: k, id }, true); return; }
     const act = ev.target.closest('[data-act]');
+    if (act && act.dataset.act === 'route') { haptic(12); setRoute(!state.route); if (isNarrow() && state.route) $('info').hidden = true; return; }
     if (act) { haptic(8); setYear(+act.dataset.y, true); return; }
     if (ev.target.closest('a')) return;
     if (ev.target.closest('.close') || isNarrow()) { haptic(8); select(null); }
@@ -988,6 +1112,11 @@ function main() {
   });
   setupControls();
   setupInfo();
+  $('routeBar').addEventListener('click', (ev) => {
+    const go = ev.target.closest('[data-go]');
+    if (go) { haptic(8); const [k, id] = go.dataset.go.split(':'); select({ kind: k, id }, true); return; }
+    if (ev.target.closest('[data-act="route-off"]')) { haptic(8); setRoute(false); }
+  });
   setupTimebar();
   setYear(1661, false);
   window.addEventListener('resize', resize);
@@ -1000,7 +1129,7 @@ function main() {
   fitRange(S.b - 12, S.d + 8);
   if (!isNarrow()) select({ kind: 'p', id: state.subject }, false);
   requestAnimationFrame(frame);
-  window.__world = { state, ctl, select, setYear, camera: () => camera, relationToSubject, pathFromSubject };
+  window.__world = { state, ctl, select, setYear, setRoute, camera: () => camera, relationToSubject, pathFromSubject, routeTo };
 }
 
 main();
