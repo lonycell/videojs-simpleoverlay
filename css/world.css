@@ -63,6 +63,24 @@
 .go:hover, .go:focus-visible { background: color-mix(in srgb, var(--c) 16%, transparent); outline: none; }
 .world-info .acts a.glass-btn { display: inline-flex; align-items: center; text-decoration: none; }
 
+/* 경로만 보기 막대 */
+.route-bar {
+  position: absolute; left: 50%; top: 92px; z-index: 6; transform: translateX(-50%);
+  width: min(900px, calc(100% - 32px)); display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 6px 12px;
+  padding: 10px 14px; border-radius: 14px; background: var(--glass-strong); border: 1px solid var(--edge-hi);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.4), 0 0 24px rgba(111, 230, 255, 0.12);
+  backdrop-filter: blur(18px) saturate(140%); -webkit-backdrop-filter: blur(18px) saturate(140%);
+}
+.route-bar p { margin: 0; display: flex; gap: 10px; align-items: baseline; grid-column: 1; }
+.route-bar p b { font: 600 0.8rem var(--f-body); color: var(--accent); white-space: nowrap; }
+.route-bar p span { font-size: 0.76rem; color: var(--ink-2); }
+.route-bar .route { grid-column: 1; display: flex; flex-wrap: wrap; align-items: center; gap: 4px 2px; }
+.route-bar .route i { font-style: normal; font-size: 0.7rem; color: var(--ink-3); padding: 0 4px; }
+.route-bar .route i::before { content: "→ "; color: var(--accent); }
+.route-bar > .glass-btn { grid-column: 2; grid-row: 1 / span 2; }
+body.route-on .hud-top .controls { opacity: 0.35; }
+body.route-on .hud-top .controls:hover, body.route-on .hud-top .controls:focus-within { opacity: 1; }
+
 /* 타임바 */
 .timebar {
   position: absolute; left: 50%; bottom: 62px; z-index: 5; transform: translateX(-50%);
@@ -98,6 +116,9 @@
 .tb-track input[type=range]:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 4px; }
 
 @media (max-width: 820px) {
+  .route-bar { top: calc(64px + env(safe-area-inset-top, 0px)); grid-template-columns: 1fr; max-height: 40%; overflow: auto; padding: 8px 10px; }
+  .route-bar > .glass-btn { grid-column: 1; grid-row: auto; justify-self: start; }
+  body.controls-open .route-bar { display: none; }
   .timebar { bottom: calc(66px + env(safe-area-inset-bottom, 0px)); padding: 8px 10px 10px; gap: 10px; }
   .tb-head b { font-size: 1.05rem; }
   .world .info { bottom: calc(146px + env(safe-area-inset-bottom, 0px)); max-height: 44%; }
