@@ -1,0 +1,1007 @@
+// 세계사 인물·사건 연관도(world.html): 시간이 흐르는 축 위에 인물의 생애와 사건을 3D로 엮는다.
+//   · 가로축(x)이 연도. 시대마다 바닥에 색 띠와 경계 고리를 두고, 연도 커서로 그 해를 훑어볼 수 있다.
+//   · 인물은 태어나서 죽을 때까지의 생애선(빛나는 관)으로, 가문·분야별로 축 둘레의 각도 구역에 놓인다.
+//     중심 인물(루이 14세)은 축 한가운데를 지난다.
+//   · 사건은 축 바로 위 레일의 수정(크리스털)과 축을 감싸는 고리. 기간이 있는 사건은 레일 위 막대로 이어진다.
+//   · 선: 부모→자녀(그 자녀가 태어난 해에서), 혼인·연인(그 해), 사건 참여(사건이 일어난 해), 그 밖의 관계.
+// 렌더링은 js/fx3d.js(버블 가계도와 같은 셰이더·후처리)를 쓴다.
+(function () {
+'use strict';
+
+const G = window.Genealogy;
+const T = window.THREE;
+const missing = new Map();
+const $ = (id) => document.getElementById(id) || missing.get(id) ||
+  (missing.set(id, document.createElement('div')), missing.get(id));
+const isNarrow = () => window.matchMedia('(max-width: 820px)').matches;
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+function haptic(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) { /* 무시 */ } }
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+// ── 배치 상수 ──────────────────────────────────────────
+const YS = 1.25;          // 1년의 길이
+let X0 = 1638;            // 이 연도가 x=0 (중심 인물의 출생 연도로 바뀐다)
+const xOf = (y) => (y - X0) * YS;
+const R0 = 8, LANE = 2.4; // 인물 구역의 안쪽 반지름, 줄 간격
+const RAIL_R = 3.4;       // 사건 레일 반지름
+const DEG = Math.PI / 180;
+// 분류별 각도(도): 위(90)가 중심 왕가, 앞(0)이 대신, 아래·뒤로 외국 왕가
+const GROUP_ANGLE = { bourbon: 90, cadet: 55, court: 20, state: -15, arts: -50, army: -88, valois: 125, spain: 160, austria: 195, italy: 230, stuart: 262, orange: 300 };
+const LINK_COLORS = { union: '#ff8fbf', liaison: '#ff6aa8', relation: '#c7b8ff' };
+const REL_KO = {
+  mentor: '스승·후견', patron: '후원', minister: '대신', rival: '맞수', ally: '동맹', served: '섬김', friend: '친구',
+  collaborator: '협업', sibling: '형제자매', kin: '친척', tutor: '스승', confessor: '고해 신부', arrest: '체포',
+  investigated: '수사', client: '의뢰', negotiator: '협상', regent: '섭정', guardian: '후견', agent: '첩자', precursor: '선행 사건',
+};
+
+const state = {
+  data: null, meta: null, persons: new Map(), events: new Map(), subject: null,
+  selected: null, hovered: null, // { kind: 'p'|'e', id }
+  year: 1661, timeFocus: false, follow: true, playing: false,
+  show: { family: true, union: true, event: true, relation: true, era: true },
+  autoRotate: false,
+};
+
+// ── 데이터 준비 ────────────────────────────────────────
+function loadData(data) {
+  const persons = new Map(), events = new Map();
+  for (const r of data.persons) {
+    const [id, ko, en, b, d, g, group, title, f, m, wiki] = r;
+    persons.set(id, { id, ko, en, b, d, g, group, title, f, m, wiki, kids: [], spouses: [], rels: [], events: [] });
+  }
+  for (const p of persons.values()) {
+    for (const par of [p.f, p.m]) if (par && persons.has(par)) persons.get(par).kids.push(p.id);
+  }
+  for (const [a, b, year, kind] of data.unions) {
+    persons.get(a).spouses.push({ id: b, year, kind });
+    persons.get(b).spouses.push({ id: a, year, kind });
+  }
+  for (const [a, b, type, note] of data.relations) {
+    persons.get(a).rels.push({ id: b, type, note, dir: 1 });
+    persons.get(b).rels.push({ id: a, type, note, dir: -1 });
+  }
+  for (const e of data.events) {
+    events.set(e.id, { ...e });
+    for (const [pid, role] of e.people) persons.get(pid).events.push({ id: e.id, role });
+  }
+  for (const p of persons.values()) p.kids.sort((a, b) => persons.get(a).b - persons.get(b).b);
+  state.data = data; state.meta = data.meta; state.persons = persons; state.events = events;
+  state.subject = data.meta.subject;
+  X0 = persons.get(state.subject).b;
+  layout();
+}
+
+// 분류마다 생애가 겹치지 않게 줄(lane)을 나눠 반지름을 정한다(구간 일정 배정).
+function layout() {
+  const byGroup = new Map();
+  for (const p of state.persons.values()) {
+    if (p.id === state.subject) continue;
+    if (!byGroup.has(p.group)) byGroup.set(p.group, []);
+    byGroup.get(p.group).push(p);
+  }
+  for (const [group, list] of byGroup) {
+    list.sort((a, b) => a.b - b.b || a.d - b.d);
+    const ends = [];
+    for (const p of list) {
+      let lane = ends.findIndex((e) => e + 4 <= p.b);
+      if (lane < 0) { lane = ends.length; ends.push(0); }
+      ends[lane] = p.d;
+      p.lane = lane;
+      p.radius = R0 + lane * LANE;
+      p.angle = (GROUP_ANGLE[group] ?? 0) * DEG + ((lane % 3) - 1) * 0.15;
+    }
+  }
+  const s = state.persons.get(state.subject);
+  s.lane = 0; s.radius = 0; s.angle = 90 * DEG;
+  for (const p of state.persons.values()) {
+    p.y = p.radius * Math.sin(p.angle);
+    p.z = p.radius * Math.cos(p.angle);
+    p.bead = new T.Vector3(xOf((p.b + p.d) / 2), p.y, p.z);
+  }
+  // 사건 레일: 시기가 겹치면 레일 둘레로 비켜 놓는다.
+  const evs = [...state.events.values()].sort((a, b) => a.from - b.from);
+  const ends = [];
+  const offs = [0, 1, -1, 2, -2, 3, -3, 4, -4];
+  for (const e of evs) {
+    let lane = ends.findIndex((end) => end + 2 <= e.from);
+    if (lane < 0) { lane = ends.length; ends.push(0); }
+    ends[lane] = Math.max(e.to, e.from + 2);
+    e.lane = lane;
+    e.angle = (90 + offs[lane % offs.length] * 24) * DEG;
+    e.y = RAIL_R * Math.sin(e.angle);
+    e.z = RAIL_R * Math.cos(e.angle);
+    e.pos = new T.Vector3(xOf(e.from), e.y, e.z);
+  }
+}
+const pointOn = (p, year) => new T.Vector3(xOf(Math.min(p.d, Math.max(p.b, year))), p.y, p.z);
+const aliveAt = (p, y) => p.b <= y && y <= p.d;
+const eraAt = (y) => state.meta.eras.find((e) => e.from <= y && y < e.to) || state.meta.eras[state.meta.eras.length - 1];
+const groupOf = (id) => state.meta.groups.find((g) => g.id === id);
+const typeOf = (t) => state.meta.eventTypes[t] || { name: t, color: '#ffffff' };
+
+// ── 루이 14세와의 관계(호칭) ─────────────────────────────
+function ancestors(id) {
+  const out = new Map([[id, { d: 0, first: null }]]);
+  const q = [id];
+  while (q.length) {
+    const cur = q.shift();
+    const p = state.persons.get(cur);
+    for (const [par, side] of [[p.f, 'f'], [p.m, 'm']]) {
+      if (!par || out.has(par)) continue;
+      out.set(par, { d: out.get(cur).d + 1, first: out.get(cur).first || side });
+      q.push(par);
+    }
+  }
+  return out;
+}
+function blood(a, b) {
+  const A = ancestors(a), B = ancestors(b);
+  let best = null;
+  for (const [c, x] of A) {
+    const y = B.get(c);
+    if (!y) continue;
+    if (!best || x.d + y.d < best.up + best.down) best = { up: x.d, down: y.d, via: c, side: x.first };
+  }
+  return best;
+}
+function bloodTerm(r, target) {
+  const F = target.g === 'F';
+  const { up, down, side } = r;
+  const oe = side === 'm' ? '외' : '';
+  if (!up && !down) return '본인';
+  if (!up) return [null, F ? '딸' : '아들', F ? '손녀' : '손자', F ? '증손녀' : '증손자', F ? '고손녀' : '고손자'][down] || `${down}대손`;
+  if (!down) {
+    if (up === 1) return F ? '어머니' : '아버지';
+    const base = [null, null, '할', '증조할', '고조할'][up];
+    return base ? `${oe}${base}${F ? '머니' : '아버지'}` : `${oe}${up}대조${F ? '모' : '부'}`;
+  }
+  if (up === 1 && down === 1) {
+    const me = state.persons.get(state.subject);
+    const half = !(target.f && target.f === me.f && target.m && target.m === me.m);
+    return `${half ? '이복 ' : ''}${F ? '자매' : '형제'}`;
+  }
+  if (up === 2 && down === 1) return side === 'm' ? (F ? '이모' : '외삼촌') : (F ? '고모' : '삼촌');
+  if (up === 1 && down === 2) return F ? '조카딸' : '조카';
+  if (up === 2 && down === 2) return side === 'm' ? '외사촌' : '사촌';
+  if (up === 3 && down === 1) return `${oe}종조${F ? '모' : '부'}`;
+  if (up === 1 && down === 3) return F ? '종손녀' : '종손';
+  return `${up + down}촌 혈족`;
+}
+function spouseWord(of, sp, kind) {
+  if (kind === 'l') return '연인';
+  return sp.g === 'F' ? (of.id === state.subject ? '왕비' : '아내') : '남편';
+}
+const SPECIAL = { '아들의 아내': '며느리', '딸의 남편': '사위', '손자의 아내': '손자며느리', '손녀의 남편': '손녀사위', '왕비의 아버지': '장인', '왕비의 어머니': '장모' };
+function relationToSubject(id) {
+  const S = state.subject;
+  if (id === S) return { term: '중심 인물', chon: null };
+  const t = state.persons.get(id);
+  const b = blood(S, id);
+  const cands = [];
+  if (b) cands.push({ term: bloodTerm(b, t), chon: b.up + b.down, cost: b.up + b.down });
+  const me = state.persons.get(S);
+  const direct = me.spouses.find((s) => s.id === id);
+  if (direct) cands.push({ term: spouseWord(me, t, direct.kind), chon: 0, cost: 0 });
+  // 혈족의 배우자
+  for (const s of t.spouses) {
+    if (s.id === S) continue;
+    const r = blood(S, s.id);
+    if (!r) continue;
+    const base = `${bloodTerm(r, state.persons.get(s.id))}의 ${spouseWord(state.persons.get(s.id), t, s.kind)}`;
+    cands.push({ term: SPECIAL[base] || base, chon: r.up + r.down, cost: r.up + r.down + 0.5 });
+  }
+  // 배우자의 혈족
+  for (const s of me.spouses) {
+    const r = blood(s.id, id);
+    if (!r || s.id === id) continue;
+    const sp = state.persons.get(s.id);
+    const base = `${spouseWord(me, sp, s.kind)}의 ${bloodTerm(r, t).replace('본인', '')}`;
+    cands.push({ term: SPECIAL[base] || base, chon: r.up + r.down, cost: r.up + r.down + 0.6 });
+  }
+  cands.sort((a, b) => a.cost - b.cost);
+  return cands[0] || null;
+}
+// 혈연·혼인·관계를 모두 이어 중심 인물에서 그 사람까지의 가장 짧은 경로
+function pathFromSubject(id) {
+  const S = state.subject;
+  const prev = new Map([[S, null]]);
+  const q = [S];
+  while (q.length) {
+    const cur = q.shift();
+    if (cur === id) break;
+    const p = state.persons.get(cur);
+    const nb = [p.f, p.m, ...p.kids, ...p.spouses.map((s) => s.id), ...p.rels.map((r) => r.id)].filter(Boolean);
+    for (const n of nb) if (!prev.has(n)) { prev.set(n, cur); q.push(n); }
+  }
+  if (!prev.has(id)) return null;
+  const path = [];
+  for (let c = id; c; c = prev.get(c)) path.unshift(c);
+  return path;
+}
+
+// ── 3D 장면 ──────────────────────────────────────────────
+let renderer, scene, camera, fx, post;
+let beads, gems, lifelines, links, rings, pickLife, ticks, eraRings, cursor, axisBeam, sky, dust;
+// 휴대폰처럼 세로로 긴 화면에서는 시간 축을 세로로 세운다(위가 과거, 아래가 미래). 모든 장면 요소를 root에 담아 돌린다.
+let root, vertical = false;
+const toWorld = (v) => root.localToWorld(v.clone());
+const toLocal = (v) => root.worldToLocal(v.clone());
+const canvas = $('gl');
+const segs = []; // 연결선 토막 목록(링크별 시작·개수)
+let linkList = [];
+let dirty = true;
+
+function initGL() {
+  try { renderer = new T.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' }); }
+  catch (e) { $('fallback').hidden = false; return false; }
+  if (!renderer.capabilities.isWebGL2) { $('fallback').hidden = false; return false; }
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, isNarrow() ? 1.75 : 2));
+  scene = new T.Scene();
+  camera = new T.PerspectiveCamera(45, 1, 0.5, 6000);
+  fx = G.FX3D({ renderer, scene, camera });
+  sky = new T.Mesh(new T.SphereGeometry(2500, 48, 24), fx.skyMaterial());
+  sky.renderOrder = -10;
+  scene.add(sky);
+  dust = fx.makeDust();
+  dust.scale.set(2.2, 0.6, 0.6);
+  dust.position.y = 20;
+  scene.add(dust);
+  post = fx.makePost();
+  root = new T.Group();
+  vertical = isNarrow() && window.innerHeight > window.innerWidth;
+  if (vertical) root.rotation.z = -Math.PI / 2;
+  scene.add(root);
+  root.updateMatrixWorld(true);
+  return true;
+}
+
+function buildScene() {
+  const { persons, events, meta } = state;
+  const P = [...persons.values()], E = [...events.values()];
+  const col = (hex) => new T.Color(hex);
+
+  // 시간 축 빛기둥
+  axisBeam = new T.Mesh(new T.CylinderGeometry(1, 1, 1, 16, 1, true), fx.axisMaterial());
+  axisBeam.material.uniforms.uVis.value = 0.55;
+  const xa = xOf(meta.range[0]), xb = xOf(meta.range[1]);
+  axisBeam.scale.set(0.05, xb - xa, 0.05);
+  axisBeam.rotation.z = Math.PI / 2;
+  axisBeam.position.set((xa + xb) / 2, 0, 0);
+  axisBeam.frustumCulled = false;
+  root.add(axisBeam);
+
+  // 연도 눈금: 10년마다 작은 고리, 50년·100년마다 큰 고리
+  const tick = [];
+  const circle = (x, r, n = 48) => {
+    for (let k = 0; k < n; k++) {
+      const a0 = (k / n) * Math.PI * 2, a1 = ((k + 1) / n) * Math.PI * 2;
+      tick.push(x, Math.sin(a0) * r, Math.cos(a0) * r, x, Math.sin(a1) * r, Math.cos(a1) * r);
+    }
+  };
+  for (let y = Math.ceil(meta.range[0] / 10) * 10; y <= meta.range[1]; y += 10) circle(xOf(y), y % 100 === 0 ? 2.6 : y % 50 === 0 ? 1.8 : 1.1, 40);
+  const tg = new T.BufferGeometry();
+  tg.setAttribute('position', new T.Float32BufferAttribute(tick, 3));
+  ticks = new T.LineSegments(tg, new T.LineBasicMaterial({ color: col('#9fc8ff'), transparent: true, opacity: 0.35, blending: T.AdditiveBlending, depthWrite: false }));
+  root.add(ticks);
+
+  // 시대: 경계 고리와 바닥 띠
+  const ring = [], ringCol = [];
+  const FLOOR = -44;
+  eraRings = new T.Group();
+  for (const era of meta.eras) {
+    const c = col(era.color);
+    const x = xOf(era.from), n = 120, r = 40;
+    for (let k = 0; k < n; k++) {
+      if (k % 2) continue;
+      const a0 = (k / n) * Math.PI * 2, a1 = ((k + 1) / n) * Math.PI * 2;
+      ring.push(x, Math.sin(a0) * r, Math.cos(a0) * r, x, Math.sin(a1) * r, Math.cos(a1) * r);
+      ringCol.push(c.r, c.g, c.b, c.r, c.g, c.b);
+    }
+    const w = xOf(era.to) - xOf(era.from);
+    const strip = new T.Mesh(new T.PlaneGeometry(w, 26), new T.MeshBasicMaterial({ color: c, transparent: true, opacity: 0.16, blending: T.AdditiveBlending, depthWrite: false, side: T.DoubleSide }));
+    strip.rotation.x = -Math.PI / 2;
+    strip.position.set(xOf(era.from) + w / 2, FLOOR, 0);
+    eraRings.add(strip);
+    const edge = new T.Mesh(new T.PlaneGeometry(0.35, 26), new T.MeshBasicMaterial({ color: c, transparent: true, opacity: 0.7, blending: T.AdditiveBlending, depthWrite: false, side: T.DoubleSide }));
+    edge.rotation.x = -Math.PI / 2;
+    edge.position.set(xOf(era.from), FLOOR + 0.05, 0);
+    eraRings.add(edge);
+  }
+  const rg = new T.BufferGeometry();
+  rg.setAttribute('position', new T.Float32BufferAttribute(ring, 3));
+  rg.setAttribute('color', new T.Float32BufferAttribute(ringCol, 3));
+  eraRings.add(new T.LineSegments(rg, new T.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.14, blending: T.AdditiveBlending, depthWrite: false })));
+  root.add(eraRings);
+
+  // 연도 커서: 그 해를 지나는 둥근 빛의 막
+  cursor = new T.Mesh(new T.CircleGeometry(40, 128), new T.ShaderMaterial({
+    uniforms: { uTime: fx.uTime, uColor: { value: col('#6fe6ff') }, uVis: { value: 0 } },
+    transparent: true, depthWrite: false, blending: T.AdditiveBlending, side: T.DoubleSide,
+    vertexShader: 'varying vec2 vP; void main(){ vP = position.xy; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+    fragmentShader: `uniform float uTime, uVis; uniform vec3 uColor; varying vec2 vP;
+      void main(){ float r = length(vP) / 40.0;
+        float rim = smoothstep(0.94, 0.995, r) * (1.0 - smoothstep(0.995, 1.0, r));
+        float rings = smoothstep(0.48, 0.5, abs(fract(r * 8.0 - uTime * 0.25) - 0.5)) * 0.18;
+        float a = clamp((rim * 1.2 + rings * (1.0 - r) + 0.035) * uVis, 0.0, 1.0);
+        gl_FragColor = vec4(uColor * a, a); }`,
+  }));
+  cursor.rotation.y = Math.PI / 2;
+  cursor.renderOrder = 5;
+  root.add(cursor);
+
+  // 인물: 구슬 + 생애선(관)
+  beads = fx.instanced(new T.SphereGeometry(1, 40, 28), fx.sphereMaterial(), P.length, [['aColor', 3], ['aParams', 4]]);
+  pickLife = new T.InstancedMesh(new T.CylinderGeometry(1, 1, 1, 6, 1, true), new T.MeshBasicMaterial({ visible: false }), P.length);
+  pickLife.frustumCulled = false;
+  const _m = new T.Matrix4(), _q = new T.Quaternion(), _s = new T.Vector3(), _up = new T.Vector3(0, 1, 0), _x = new T.Vector3(1, 0, 0);
+  const qx = new T.Quaternion().setFromUnitVectors(_up, _x);
+  P.forEach((p, i) => {
+    p.index = i;
+    const r = p.id === state.subject ? 2.0 : 0.95;
+    _m.compose(p.bead, _q.identity(), _s.set(r, r, r));
+    beads.setMatrixAt(i, _m);
+    const c = col(groupOf(p.group).color);
+    p.color = c;
+    beads.geometry.attributes.aColor.setXYZ(i, c.r, c.g, c.b);
+    const len = Math.max(0.5, xOf(p.d) - xOf(p.b));
+    _m.compose(new T.Vector3(xOf(p.b) + len / 2, p.y, p.z), qx, _s.set(0.9, len, 0.9));
+    pickLife.setMatrixAt(i, _m);
+  });
+  beads.count = P.length;
+  root.add(beads, pickLife);
+
+  // 사건: 수정 + 축을 감싸는 고리
+  gems = fx.instanced(new T.OctahedronGeometry(1, 0), fx.sphereMaterial(), E.length, [['aColor', 3], ['aParams', 4]]);
+  rings = fx.instanced(new T.TorusGeometry(1, 0.03, 8, 96), fx.ringMaterial(), E.length, [['aColor', 3], ['aParams', 4]]);
+  const qr = new T.Quaternion().setFromAxisAngle(_up, Math.PI / 2);
+  E.forEach((e, i) => {
+    e.index = i;
+    const big = e.type === 'war' ? 1.25 : e.type === 'battle' ? 0.8 : 0.95;
+    _m.compose(e.pos, new T.Quaternion().setFromEuler(new T.Euler(0.4, 0.6 * i, 0)), _s.set(big, big * 1.35, big));
+    gems.setMatrixAt(i, _m);
+    const c = col(typeOf(e.type).color);
+    e.color = c;
+    gems.geometry.attributes.aColor.setXYZ(i, c.r, c.g, c.b);
+    _m.compose(new T.Vector3(xOf(e.from), 0, 0), qr, _s.set(RAIL_R, RAIL_R, RAIL_R));
+    rings.setMatrixAt(i, _m);
+    rings.geometry.attributes.aColor.setXYZ(i, c.r, c.g, c.b);
+  });
+  gems.count = E.length; rings.count = E.length;
+  root.add(gems, rings);
+
+  // 연결선 목록
+  linkList = [];
+  const add = (kind, a, b, A, B, colA, colB, opts = {}) => linkList.push({ kind, a, b, A, B, colA, colB, ...opts });
+  for (const p of P) {
+    // 생애선
+    add('life', { k: 'p', id: p.id }, null, new T.Vector3(xOf(p.b), p.y, p.z), new T.Vector3(xOf(p.d), p.y, p.z), p.color, p.color,
+      { width: p.id === state.subject ? 0.34 : 0.15, straight: true, n: 1 });
+    for (const par of [p.f, p.m]) {
+      if (!par) continue;
+      const q = persons.get(par);
+      add('family', { k: 'p', id: par }, { k: 'p', id: p.id }, pointOn(q, p.b), new T.Vector3(xOf(p.b), p.y, p.z), q.color, p.color, { width: 0.07, n: 10 });
+    }
+  }
+  for (const [a, b, year, kind] of state.data.unions) {
+    const A = persons.get(a), B = persons.get(b);
+    add(kind === 'l' ? 'liaison' : 'union', { k: 'p', id: a }, { k: 'p', id: b }, pointOn(A, year), pointOn(B, year),
+      col(LINK_COLORS[kind === 'l' ? 'liaison' : 'union']), col(LINK_COLORS[kind === 'l' ? 'liaison' : 'union']), { width: kind === 'l' ? 0.05 : 0.08, n: 8 });
+  }
+  for (const [a, b] of state.data.relations) {
+    const A = persons.get(a), B = persons.get(b);
+    const y = (Math.max(A.b, B.b) + Math.min(A.d, B.d)) / 2;
+    add('relation', { k: 'p', id: a }, { k: 'p', id: b }, pointOn(A, y), pointOn(B, y), col(LINK_COLORS.relation), col(LINK_COLORS.relation), { width: 0.04, n: 8 });
+  }
+  for (const e of E) {
+    if (e.to > e.from) add('duration', { k: 'e', id: e.id }, null, e.pos.clone(), new T.Vector3(xOf(e.to + 0.6), e.y, e.z), e.color, e.color, { width: 0.22, straight: true, n: 1 });
+    for (const [pid] of e.people) {
+      const p = persons.get(pid);
+      add('event', { k: 'e', id: e.id }, { k: 'p', id: pid }, e.pos.clone(), pointOn(p, e.from), e.color, p.color, { width: 0.045, n: 6 });
+    }
+  }
+  const total = linkList.reduce((s, l) => s + l.n, 0);
+  links = fx.instanced(new T.CylinderGeometry(1, 1, 1, 8, 1, true), fx.edgeMaterial(), total, [['aColA', 3], ['aColB', 3], ['aSeg', 2], ['aParams', 4]]);
+  links.renderOrder = 2;
+  // 곡선: 축에서 바깥으로 부풀어 오르는 베지에(서로 겹치는 직선을 피한다)
+  const A = links.geometry.attributes;
+  let e = 0;
+  const P0 = new T.Vector3(), P1 = new T.Vector3(), P2 = new T.Vector3(), P3 = new T.Vector3(), a = new T.Vector3(), b = new T.Vector3(), v = new T.Vector3();
+  const bez = (t, out) => { const u = 1 - t; return out.set(0, 0, 0).addScaledVector(P0, u * u * u).addScaledVector(P1, 3 * u * u * t).addScaledVector(P2, 3 * u * t * t).addScaledVector(P3, t * t * t); };
+  const outward = (pt, amt) => { const r = Math.hypot(pt.y, pt.z) || 1; return new T.Vector3(0, (pt.y / r) * amt, (pt.z / r) * amt); };
+  for (const L of linkList) {
+    L.start = e;
+    P0.copy(L.A); P3.copy(L.B);
+    if (L.straight) { P1.lerpVectors(P0, P3, 1 / 3); P2.lerpVectors(P0, P3, 2 / 3); }
+    else {
+      const d = P0.distanceTo(P3);
+      const bulge = Math.min(10, d * 0.35);
+      P1.copy(P0).lerp(P3, 0.25).add(outward(P0, bulge));
+      P2.copy(P0).lerp(P3, 0.75).add(outward(P3, bulge));
+      if (L.kind === 'family') { P1.x = P0.x; P2.x = P3.x; } // 자녀가 태어난 해의 단면 안에서 휘어진다
+    }
+    for (let k = 0; k < L.n; k++) {
+      const t0 = k / L.n, t1 = (k + 1) / L.n;
+      bez(t0, a); bez(t1, b);
+      v.subVectors(b, a);
+      const len = v.length() || 0.001;
+      _q.setFromUnitVectors(_up, v.divideScalar(len));
+      _m.compose(a.clone().add(b).multiplyScalar(0.5), _q, _s.set(L.width, len * 1.02, L.width));
+      links.setMatrixAt(e, _m);
+      A.aColA.setXYZ(e, L.colA.r, L.colA.g, L.colA.b);
+      A.aColB.setXYZ(e, L.colB.r, L.colB.g, L.colB.b);
+      A.aSeg.setXY(e, t0, t1);
+      e++;
+    }
+  }
+  links.count = e;
+  links.instanceMatrix.needsUpdate = true;
+  for (const k of ['aColA', 'aColB', 'aSeg']) A[k].needsUpdate = true;
+  root.add(links);
+  for (const m of [beads, gems, rings]) { m.instanceMatrix.needsUpdate = true; m.geometry.attributes.aColor.needsUpdate = true; }
+  dirty = true;
+}
+
+// 선택·연도 커서에 따라 밝기를 다시 정한다(바뀔 때만).
+function relatedSets() {
+  const sel = state.selected;
+  if (!sel) return null;
+  const ps = new Set(), es = new Set();
+  if (sel.kind === 'p') {
+    const p = state.persons.get(sel.id);
+    ps.add(p.id);
+    for (const x of [p.f, p.m, ...p.kids, ...p.spouses.map((s) => s.id), ...p.rels.map((r) => r.id)]) if (x) ps.add(x);
+    for (const ev of p.events) es.add(ev.id);
+  } else {
+    const ev = state.events.get(sel.id);
+    es.add(ev.id);
+    for (const [pid] of ev.people) ps.add(pid);
+  }
+  return { ps, es };
+}
+function refresh() {
+  const rel = relatedSets();
+  const Y = state.year, tf = state.timeFocus;
+  const hov = state.hovered;
+  const pVis = (p) => {
+    let v = 1;
+    if (rel) v = rel.ps.has(p.id) ? 1 : 0.18;
+    if (tf && !aliveAt(p, Y)) v *= 0.3;
+    return v;
+  };
+  const eVis = (e) => {
+    let v = 1;
+    if (rel) v = rel.es.has(e.id) ? 1 : 0.15;
+    if (tf && !(e.from - 1 <= Y && Y <= e.to + 1)) v *= 0.3;
+    return v;
+  };
+  const sp = beads.geometry.attributes.aParams;
+  for (const p of state.persons.values()) {
+    const v = pVis(p);
+    const isSel = state.selected && state.selected.kind === 'p' && state.selected.id === p.id;
+    const isHov = hov && hov.kind === 'p' && hov.id === p.id;
+    p.vis = v;
+    sp.setXYZW(p.index, (p.id === state.subject ? 1.5 : 1.0) * (0.25 + 0.75 * v), isHov ? 1 : isSel ? 0.8 : 0, v < 0.5 ? 0.6 : 0, (p.index * 0.618) % 1);
+  }
+  sp.needsUpdate = true;
+  const gp = gems.geometry.attributes.aParams, rp = rings.geometry.attributes.aParams;
+  for (const e of state.events.values()) {
+    const v = state.show.event ? eVis(e) : 0.05;
+    const isSel = state.selected && state.selected.kind === 'e' && state.selected.id === e.id;
+    const isHov = hov && hov.kind === 'e' && hov.id === e.id;
+    e.vis = v;
+    gp.setXYZW(e.index, 1.3 * (0.25 + 0.75 * v), isHov ? 1 : isSel ? 0.8 : 0, 0, (e.index * 0.37) % 1);
+    rp.setX(e.index, v * (isSel ? 1 : 0.45));
+  }
+  gp.needsUpdate = true; rp.needsUpdate = true;
+  const lp = links.geometry.attributes.aParams;
+  for (const L of linkList) {
+    const showK = L.kind === 'life' || L.kind === 'duration' ? true : L.kind === 'liaison' ? state.show.union : state.show[L.kind];
+    const end = (x) => (!x ? 1 : x.k === 'p' ? state.persons.get(x.id).vis : state.events.get(x.id).vis);
+    let v = showK ? Math.min(end(L.a), end(L.b)) : 0;
+    if (L.kind === 'duration' && !state.show.event) v = 0;
+    let hot = 0;
+    if (state.selected && v > 0.9 && L.kind !== 'life') hot = 1;
+    const base = { life: [0.7, 0.12, 0.3], family: [0.9, 0.35, 0.5], union: [0.9, 0.2, 0.4], liaison: [0.6, 0.2, 0.2], relation: [0.55, 0.25, 0.15], event: [0.6, 0.45, 0.3], duration: [1.0, 0.4, 0.8] }[L.kind];
+    for (let k = 0; k < L.n; k++) {
+      lp.setXYZW(L.start + k, base[0] * (0.4 + 0.6 * v), base[1], hot ? 1 : base[2], v * (L.kind === 'life' ? 0.9 : 1) * (hot ? 1.3 : 1));
+    }
+  }
+  lp.needsUpdate = true;
+  eraRings.visible = state.show.era;
+  dirty = false;
+}
+
+// ── 카메라 ───────────────────────────────────────────────
+const ctl = { target: new T.Vector3(), goal: null, theta: 0.5, phi: 1.18, radius: 160, radiusGoal: 160, vTheta: 0, vPhi: 0, idle: 0 };
+function updateCamera(dt) {
+  if (ctl.goal) {
+    ctl.target.lerp(ctl.goal, 1 - Math.exp(-dt * 3.2));
+    if (ctl.target.distanceTo(ctl.goal) < 0.05) ctl.goal = null;
+  }
+  ctl.radius += (ctl.radiusGoal - ctl.radius) * (1 - Math.exp(-dt * 5));
+  ctl.theta += ctl.vTheta; ctl.phi += ctl.vPhi;
+  const damp = Math.exp(-dt * 6);
+  ctl.vTheta *= damp; ctl.vPhi *= damp;
+  ctl.idle += dt;
+  if (state.autoRotate && ctl.idle > 3) ctl.theta += dt * 0.05;
+  ctl.phi = Math.min(Math.PI - 0.15, Math.max(0.15, ctl.phi));
+  ctl.radiusGoal = Math.min(1400, Math.max(8, ctl.radiusGoal));
+  const sp = Math.sin(ctl.phi);
+  camera.position.set(ctl.target.x + ctl.radius * sp * Math.sin(ctl.theta), ctl.target.y + ctl.radius * Math.cos(ctl.phi), ctl.target.z + ctl.radius * sp * Math.cos(ctl.theta));
+  camera.lookAt(ctl.target);
+}
+function flyTo(v, radius) {
+  ctl.goal = toWorld(v); // v는 root 안의 좌표
+  if (radius) ctl.radiusGoal = radius;
+}
+function fitRange(y0, y1) {
+  const w = (y1 - y0) * YS + 30;
+  const tanV = Math.tan((camera.fov * Math.PI) / 360);
+  ctl.goal = toWorld(new T.Vector3(xOf((y0 + y1) / 2), 0, 0));
+  ctl.radiusGoal = vertical
+    ? Math.max(60, Math.max(w / 2 / tanV, 50 / (tanV * camera.aspect)))
+    : Math.max(60, Math.max(70 / tanV, w / 2 / (tanV * camera.aspect)));
+}
+
+function setupControls() {
+  const pointers = new Map();
+  let downAt = null, mode = null, lastPinch = 0, lastMid = null;
+  const panBy = (dx, dy) => {
+    const s = ctl.radius * 0.0014;
+    const right = new T.Vector3().setFromMatrixColumn(camera.matrix, 0);
+    const up = new T.Vector3().setFromMatrixColumn(camera.matrix, 1);
+    ctl.target.addScaledVector(right, -dx * s).addScaledVector(up, dy * s);
+    ctl.goal = null;
+  };
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  canvas.addEventListener('touchend', (e) => { if (e.cancelable) e.preventDefault(); }, { passive: false });
+  canvas.addEventListener('pointerdown', (e) => {
+    canvas.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    ctl.idle = 0;
+    if (pointers.size === 1) {
+      downAt = { x: e.clientX, y: e.clientY, t: performance.now() };
+      mode = e.button === 2 || e.shiftKey || e.ctrlKey || e.metaKey ? 'pan' : 'rotate';
+    } else if (pointers.size === 2) {
+      const [a, b] = [...pointers.values()];
+      lastPinch = Math.hypot(a.x - b.x, a.y - b.y);
+      lastMid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      mode = 'pinch'; downAt = null;
+    }
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!pointers.has(e.pointerId)) { hoverQ = { x: e.clientX, y: e.clientY }; return; }
+    const prev = pointers.get(e.pointerId);
+    const dx = e.clientX - prev.x, dy = e.clientY - prev.y;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    ctl.idle = 0;
+    if (downAt && Math.hypot(e.clientX - downAt.x, e.clientY - downAt.y) > 8) { downAt = null; canvas.classList.add('dragging'); hideTip(); }
+    if (downAt) return;
+    if (mode === 'rotate') { ctl.vTheta = -dx * 0.0055; ctl.vPhi = -dy * 0.0045; }
+    else if (mode === 'pan') panBy(dx, dy);
+    else if (mode === 'pinch' && pointers.size === 2) {
+      const [a, b] = [...pointers.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      if (lastPinch) { ctl.radiusGoal *= lastPinch / d; ctl.radius = ctl.radiusGoal; }
+      if (lastMid) panBy(mid.x - lastMid.x, mid.y - lastMid.y);
+      lastPinch = d; lastMid = mid;
+    }
+  });
+  const end = (e) => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.delete(e.pointerId);
+    canvas.classList.remove('dragging');
+    if (downAt && pointers.size === 0 && performance.now() - downAt.t < 600) clickAt(e.clientX, e.clientY);
+    downAt = null;
+    if (pointers.size === 1) { mode = 'rotate'; lastPinch = 0; lastMid = null; }
+  };
+  canvas.addEventListener('pointerup', end);
+  canvas.addEventListener('pointercancel', end);
+  canvas.addEventListener('pointerleave', () => { if (!pointers.size) setHover(null); });
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    ctl.idle = 0;
+    ctl.radiusGoal *= Math.exp(e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0012));
+  }, { passive: false });
+  canvas.tabIndex = 0;
+  canvas.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft') setYear(state.year - 1, true);
+    else if (e.key === 'ArrowRight') setYear(state.year + 1, true);
+    else if (e.key === 'ArrowUp') ctl.vPhi = -0.05;
+    else if (e.key === 'ArrowDown') ctl.vPhi = 0.05;
+    else if (e.key === '+' || e.key === '=') ctl.radiusGoal *= 0.8;
+    else if (e.key === '-') ctl.radiusGoal *= 1.25;
+    else if (e.key === 'Escape') select(null);
+    else return;
+    e.preventDefault(); ctl.idle = 0;
+  });
+  $('zoomIn').addEventListener('click', () => { ctl.radiusGoal *= 0.72; });
+  $('zoomOut').addEventListener('click', () => { ctl.radiusGoal *= 1.38; });
+  $('zoomFit').addEventListener('click', () => { const s = state.persons.get(state.subject); fitRange(s.b - 40, s.d + 30); });
+}
+
+// ── 고르기 ───────────────────────────────────────────────
+const ray = new T.Raycaster();
+const ndc = new T.Vector2();
+const P_LIST = () => [...state.persons.values()];
+function pick(x, y) {
+  const rect = canvas.getBoundingClientRect();
+  ndc.set(((x - rect.left) / rect.width) * 2 - 1, -((y - rect.top) / rect.height) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  const hits = [];
+  beads.boundingSphere = null; gems.boundingSphere = null; pickLife.boundingSphere = null;
+  const hb = ray.intersectObject(beads, false)[0];
+  if (hb) hits.push({ d: hb.distance, sel: { kind: 'p', id: P_LIST()[hb.instanceId].id } });
+  if (state.show.event) {
+    const hg = ray.intersectObject(gems, false)[0];
+    if (hg) hits.push({ d: hg.distance - 1, sel: { kind: 'e', id: [...state.events.values()][hg.instanceId].id } });
+  }
+  const hl = ray.intersectObject(pickLife, false)[0];
+  if (hl) hits.push({ d: hl.distance + 2, sel: { kind: 'p', id: P_LIST()[hl.instanceId].id } });
+  hits.sort((a, b) => a.d - b.d);
+  return hits[0] ? hits[0].sel : null;
+}
+let hoverQ = null;
+function setHover(sel) {
+  const same = (a, b) => (!a && !b) || (a && b && a.kind === b.kind && a.id === b.id);
+  if (!same(sel, state.hovered)) { state.hovered = sel; dirty = true; }
+  canvas.classList.toggle('pointing', !!sel);
+  if (!sel) hideTip();
+}
+function processHover() {
+  if (!hoverQ) return;
+  const { x, y } = hoverQ;
+  hoverQ = null;
+  const sel = pick(x, y);
+  setHover(sel);
+  if (sel) showTip(sel, x, y);
+}
+function clickAt(x, y) {
+  const sel = pick(x, y);
+  if (!sel) { if (isNarrow()) select(null); return; }
+  haptic(10);
+  select(sel, true);
+}
+function select(sel, fly) {
+  state.selected = sel;
+  dirty = true;
+  renderInfo();
+  if (sel && fly) {
+    if (sel.kind === 'p') { const p = state.persons.get(sel.id); flyTo(new T.Vector3(p.bead.x, p.y * 0.5, p.z * 0.5)); }
+    else { const e = state.events.get(sel.id); flyTo(e.pos); setYear(e.from, false); }
+  }
+}
+
+// ── 툴팁·이름표 ──────────────────────────────────────────
+const tip = $('tip');
+function showTip(sel, x, y) {
+  if (sel.kind === 'p') {
+    const p = state.persons.get(sel.id);
+    const rel = relationToSubject(p.id);
+    tip.style.setProperty('--c', '#' + p.color.getHexString(T.SRGBColorSpace));
+    tip.innerHTML = `<b>${esc(p.ko)} <small>${esc(p.en)}</small></b><span class="t">${esc(p.title)}</span><div>${p.b}–${p.d}${rel ? ` · ${esc(rel.term)}` : ''}</div>`;
+  } else {
+    const e = state.events.get(sel.id);
+    tip.style.setProperty('--c', '#' + e.color.getHexString(T.SRGBColorSpace));
+    tip.innerHTML = `<b>${esc(e.ko)}</b><span class="t">${esc(typeOf(e.type).name)}</span> ${e.from}${e.to > e.from ? `–${e.to}` : ''}<div>${esc(e.place)} · 관련 인물 ${e.people.length}명</div>`;
+  }
+  tip.hidden = false;
+  const W = window.innerWidth, H = window.innerHeight;
+  tip.style.left = `${Math.min(W - tip.offsetWidth - 10, x + 16)}px`;
+  tip.style.top = `${Math.min(H - tip.offsetHeight - 10, Math.max(10, y + 16))}px`;
+}
+function hideTip() { tip.hidden = true; }
+
+const labelBox = $('labels');
+const labels = [];
+function buildLabels() {
+  labelBox.replaceChildren();
+  labels.length = 0;
+  for (const p of state.persons.values()) {
+    const el = document.createElement('div');
+    el.className = 'lbl' + (p.id === state.subject ? ' ego' : '');
+    el.style.setProperty('--c', '#' + p.color.getHexString(T.SRGBColorSpace));
+    el.innerHTML = `<b>${esc(p.ko)}</b><span>${p.b}–${p.d}</span>`;
+    labelBox.append(el);
+    labels.push({ kind: 'p', obj: p, el, pos: p.bead, base: p.id === state.subject ? 140 : 20 + (p.events.length + p.kids.length) * 2 });
+  }
+  for (const e of state.events.values()) {
+    const el = document.createElement('div');
+    el.className = 'lbl ev';
+    el.style.setProperty('--c', '#' + e.color.getHexString(T.SRGBColorSpace));
+    el.innerHTML = `<b>${esc(e.ko)}</b><span>${e.from}${e.to > e.from ? `–${e.to}` : ''}</span>`;
+    labelBox.append(el);
+    labels.push({ kind: 'e', obj: e, el, pos: e.pos, base: 40 + e.people.length * 2 + (e.type === 'war' ? 20 : 0) });
+  }
+  const meta = state.meta;
+  for (let y = Math.ceil(meta.range[0] / 50) * 50; y <= meta.range[1]; y += 50) {
+    const el = document.createElement('div');
+    el.className = 'year' + (y % 100 === 0 ? ' century' : '');
+    el.textContent = y;
+    labelBox.append(el);
+    labels.push({ kind: 'y', el, pos: new T.Vector3(xOf(y), -(y % 100 === 0 ? 3.8 : 3), 0), base: 1000 });
+  }
+  for (const era of meta.eras) {
+    const el = document.createElement('div');
+    el.className = 'era';
+    el.style.setProperty('--c', era.color);
+    el.innerHTML = `<b>${esc(era.name)}</b><span>${era.from}–${era.to}</span>`;
+    labelBox.append(el);
+    labels.push({ kind: 'era', obj: era, el, pos: new T.Vector3(xOf(era.from) + 1, -40, 0), base: 500 });
+  }
+  for (const g of meta.groups) {
+    const list = [...state.persons.values()].filter((p) => p.group === g.id && p.id !== state.subject);
+    if (!list.length) continue;
+    const minB = Math.min(...list.map((p) => p.b));
+    const a = (GROUP_ANGLE[g.id] ?? 0) * DEG;
+    const el = document.createElement('div');
+    el.className = 'grp';
+    el.style.setProperty('--c', g.color);
+    el.textContent = g.name;
+    labelBox.append(el);
+    labels.push({ kind: 'g', obj: g, el, pos: new T.Vector3(xOf(minB) - 6, Math.sin(a) * (R0 + 2), Math.cos(a) * (R0 + 2)), base: 480 });
+  }
+}
+const _p = new T.Vector3();
+function updateLabels() {
+  const W = canvas.clientWidth, H = canvas.clientHeight;
+  const cam = camera.position;
+  const sel = state.selected, hov = state.hovered;
+  const rel = relatedSets();
+  const items = [];
+  for (const L of labels) {
+    if (L.kind === 'era') { L.el.style.display = state.show.era ? '' : 'none'; if (!state.show.era) continue; }
+    if (L.kind === 'e' && !state.show.event) { L.el.style.opacity = '0'; continue; }
+    const dist = cam.distanceTo(vertical ? toWorld(L.pos) : L.pos);
+    let pri = L.base;
+    if (L.kind === 'p' || L.kind === 'e') {
+      const id = L.obj.id, k = L.kind;
+      if (hov && hov.kind === k && hov.id === id) pri = 300;
+      else if (sel && sel.kind === k && sel.id === id) pri = 250;
+      else if (rel && (k === 'p' ? rel.ps : rel.es).has(id)) pri += 80;
+      if (state.timeFocus && L.kind === 'p' && aliveAt(L.obj, state.year)) pri += 40;
+      if (state.timeFocus && L.kind === 'e' && L.obj.from - 1 <= state.year && state.year <= L.obj.to + 1) pri += 60;
+      if ((L.obj.vis ?? 1) < 0.5 && pri < 200) pri -= 60;
+    }
+    items.push({ L, dist, pri });
+  }
+  items.sort((a, b) => (b.pri - a.pri) || (a.dist - b.dist));
+  const placed = [];
+  const near = isNarrow() ? 110 : 170;
+  for (const { L, dist, pri } of items) {
+    _p.copy(L.pos);
+    if (L.kind === 'p') _p.y += 1.2; else if (L.kind === 'e') _p.y += 1.6;
+    if (vertical) root.localToWorld(_p);
+    _p.project(camera);
+    const x = (_p.x * 0.5 + 0.5) * W, y = (-_p.y * 0.5 + 0.5) * H;
+    let show = _p.z < 1 && _p.z > -1 && x > -100 && x < W + 100 && y > -40 && y < H + 40;
+    if (show && (L.kind === 'p' || L.kind === 'e')) show = pri >= 200 || dist < near || (pri >= 120 && dist < near * 1.8);
+    if (show && L.kind === 'year') show = true;
+    if (show && pri < 1000) {
+      if (!L.w) { L.w = L.el.offsetWidth; L.h = L.el.offsetHeight; }
+      const rect = { l: x - L.w / 2 - 3, r: x + L.w / 2 + 3, t: y - L.h - 2, b: y + 2 };
+      if (pri < 250 || L.kind === 'era' || L.kind === 'g') for (const q of placed) if (rect.l < q.r && rect.r > q.l && rect.t < q.b && rect.b > q.t) { show = false; break; }
+      if (show) placed.push(rect);
+    }
+    if (!show) { if (L.el.style.opacity !== '0') L.el.style.opacity = '0'; continue; }
+    const fade = pri >= 200 ? 1 : Math.max(0.35, Math.min(1, 1.3 - dist / (near * 1.4)));
+    L.el.style.opacity = String(L.kind === 'g' ? Math.min(0.85, 260 / dist) : fade);
+    L.el.style.transform = `translate3d(${x.toFixed(1)}px, ${y.toFixed(1)}px, 0) translate(-50%, ${L.kind === 'year' || L.kind === 'era' || L.kind === 'g' ? '-50%' : '-100%'})`;
+    L.el.style.zIndex = String(Math.min(999, Math.round(pri)));
+    L.el.classList.toggle('sel', !!(sel && L.obj && sel.id === L.obj.id));
+    L.el.classList.toggle('hov', !!(hov && L.obj && hov.id === L.obj.id));
+  }
+}
+
+// ── 상세 카드 ────────────────────────────────────────────
+function chip(kind, id, extra = '') {
+  const o = kind === 'p' ? state.persons.get(id) : state.events.get(id);
+  const c = '#' + o.color.getHexString(T.SRGBColorSpace);
+  return `<button type="button" class="go" data-go="${kind}:${id}" style="--c:${c}">${esc(o.ko)}${extra ? `<small>${esc(extra)}</small>` : ''}</button>`;
+}
+const wikiUrl = (wiki, en) => wiki ? `https://en.wikipedia.org/wiki/${encodeURIComponent(wiki).replace(/%2F/g, '/')}` : `https://en.wikipedia.org/w/index.php?search=${encodeURIComponent(en)}`;
+function renderInfo() {
+  const box = $('info');
+  const sel = state.selected;
+  if (!sel) { box.hidden = true; return; }
+  let html;
+  if (sel.kind === 'p') {
+    const p = state.persons.get(sel.id);
+    const g = groupOf(p.group);
+    const rel = relationToSubject(p.id);
+    const path = p.id === state.subject ? null : pathFromSubject(p.id);
+    const sub = state.persons.get(state.subject);
+    const fam = [
+      p.f || p.m ? `<dt>부모</dt><dd>${[p.f, p.m].filter(Boolean).map((x) => chip('p', x)).join('')}</dd>` : '',
+      p.spouses.length ? `<dt>배우자·연인</dt><dd>${p.spouses.map((s) => chip('p', s.id, `${s.kind === 'l' ? '연인 ' : ''}${s.year}`)).join('')}</dd>` : '',
+      p.kids.length ? `<dt>자녀</dt><dd>${p.kids.map((k) => chip('p', k)).join('')}</dd>` : '',
+      p.rels.length ? `<dt>관계</dt><dd>${p.rels.map((r) => chip('p', r.id, REL_KO[r.type] || r.type)).join('')}</dd>` : '',
+      p.events.length ? `<dt>사건</dt><dd>${p.events.sort((a, b) => state.events.get(a.id).from - state.events.get(b.id).from).map((e) => chip('e', e.id, state.events.get(e.id).from)).join('')}</dd>` : '',
+    ].join('');
+    box.style.setProperty('--c', g.color);
+    html = `
+      <p class="kicker">${esc(g.name)}</p>
+      <h2>${esc(p.ko)}<small>${esc(p.en)}</small></h2>
+      <div class="rel"><b>${esc(rel ? rel.term : p.title)}</b><span>${p.b}–${p.d} · 향년 ${p.d - p.b}</span></div>
+      <p class="note">${esc(p.title)}${rel && rel.chon != null && p.id !== state.subject ? ` · ${esc(sub.ko)}와 ${rel.chon ? `${rel.chon}촌` : '무촌'}` : ''}</p>
+      ${path && path.length > 2 ? `<div class="path"><span>${esc(sub.ko)}에서 이어지는 길</span>${path.map((x) => chip('p', x)).join('<i>›</i>')}</div>` : ''}
+      <dl class="fam">${fam}</dl>
+      <div class="acts"><a class="glass-btn" href="${wikiUrl(p.wiki, p.en)}" target="_blank" rel="noopener">위키백과</a>
+        <button type="button" class="glass-btn" data-act="year" data-y="${Math.round((p.b + p.d) / 2)}">그 시대로</button></div>`;
+  } else {
+    const e = state.events.get(sel.id);
+    const t = typeOf(e.type);
+    box.style.setProperty('--c', t.color);
+    html = `
+      <p class="kicker">${esc(t.name)} · ${esc(eraAt(e.from).name)}</p>
+      <h2>${esc(e.ko)}<small>${esc(e.en)}</small></h2>
+      <div class="rel"><b>${e.from}${e.to > e.from ? `–${e.to}` : ''}</b><span>${esc(e.place)}</span></div>
+      <p class="note">${esc(e.summary)}</p>
+      <dl class="fam"><dt>관련 인물</dt><dd>${e.people.map(([pid, role]) => chip('p', pid, role)).join('')}</dd></dl>
+      <div class="acts"><a class="glass-btn" href="${wikiUrl(e.wiki, e.en)}" target="_blank" rel="noopener">위키백과</a>
+        <button type="button" class="glass-btn" data-act="year" data-y="${e.from}">그 해로</button></div>`;
+  }
+  box.innerHTML = `<button type="button" class="close" aria-label="닫기"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10.25"/><path d="M8.6 8.6l6.8 6.8M15.4 8.6l-6.8 6.8"/></svg></button>${html}`;
+  if (box.hidden) box._openedAt = performance.now();
+  box.hidden = false;
+  box.scrollTop = 0;
+}
+function setupInfo() {
+  const box = $('info');
+  box.addEventListener('click', (ev) => {
+    if (performance.now() - (box._openedAt || 0) < 400) return;
+    const go = ev.target.closest('[data-go]');
+    if (go) { haptic(8); const [k, id] = go.dataset.go.split(':'); select({ kind: k, id }, true); return; }
+    const act = ev.target.closest('[data-act]');
+    if (act) { haptic(8); setYear(+act.dataset.y, true); return; }
+    if (ev.target.closest('a')) return;
+    if (ev.target.closest('.close') || isNarrow()) { haptic(8); select(null); }
+  });
+}
+
+// ── 연도 커서와 재생 ─────────────────────────────────────
+function setYear(y, focus) {
+  const [a, b] = state.meta.range;
+  state.year = Math.max(a, Math.min(b, Math.round(y)));
+  if (focus) state.timeFocus = true;
+  $('year').value = state.year;
+  $('yearText').textContent = state.year;
+  const era = eraAt(state.year);
+  $('eraText').textContent = era.name;
+  $('timebar').style.setProperty('--c', era.color);
+  $('timeFocus').checked = state.timeFocus;
+  if (state.follow && focus) {
+    const g = toLocal(ctl.goal || ctl.target);
+    flyTo(new T.Vector3(xOf(state.year), g.y, g.z));
+  }
+  dirty = true;
+}
+function setupTimebar() {
+  const [a, b] = state.meta.range;
+  const r = $('year');
+  r.min = a; r.max = b; r.value = state.year;
+  r.addEventListener('input', () => setYear(+r.value, true));
+  $('play').addEventListener('click', () => {
+    state.playing = !state.playing;
+    $('play').classList.toggle('on', state.playing);
+    $('play').setAttribute('aria-label', state.playing ? '멈춤' : '재생');
+    if (state.playing && state.year >= b) setYear(a, true);
+    haptic(8);
+  });
+  // 시대 띠를 타임바 아래에 그린다
+  const bands = $('eraBands');
+  bands.replaceChildren(...state.meta.eras.map((e) => {
+    const s = document.createElement('i');
+    s.style.left = `${((e.from - a) / (b - a)) * 100}%`;
+    s.style.width = `${((e.to - e.from) / (b - a)) * 100}%`;
+    s.style.background = e.color;
+    s.title = `${e.name} (${e.from}–${e.to})`;
+    return s;
+  }));
+  // 중심 인물의 생애 표시
+  const S = state.persons.get(state.subject);
+  const life = $('lifeMark');
+  life.style.left = `${((S.b - a) / (b - a)) * 100}%`;
+  life.style.width = `${((S.d - S.b) / (b - a)) * 100}%`;
+  life.title = `${S.ko} ${S.b}–${S.d}`;
+}
+
+// ── 시작 ────────────────────────────────────────────────
+function resize() {
+  const w = canvas.clientWidth || window.innerWidth, h = canvas.clientHeight || window.innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  post.setSize(w, h, renderer.getPixelRatio());
+  for (const L of labels) L.w = 0;
+}
+let last = performance.now(), clock = 0, playAcc = 0;
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (document.hidden) { last = now; return; }
+  const dt = Math.min(1 / 30, (now - last) / 1000);
+  last = now;
+  clock += dt;
+  fx.uTime.value = clock;
+  if (state.playing) {
+    playAcc += dt * 8; // 1초에 8년
+    if (playAcc >= 1) { const n = Math.floor(playAcc); playAcc -= n; setYear(state.year + n, true); if (state.year >= state.meta.range[1]) { state.playing = false; $('play').classList.remove('on'); } }
+  }
+  processHover();
+  if (dirty) refresh();
+  const cv = cursor.material.uniforms.uVis;
+  cv.value += ((state.timeFocus ? 1 : 0) - cv.value) * 0.1;
+  cursor.visible = cv.value > 0.01;
+  cursor.position.x += (xOf(state.year) - cursor.position.x) * 0.25;
+  cursor.material.uniforms.uColor.value.set(eraAt(state.year).color).lerp(new T.Color('#9fe8ff'), 0.4);
+  updateCamera(dt);
+  post.render();
+  updateLabels();
+}
+
+function main() {
+  const sets = window.WORLD_DATASETS || [];
+  if (!sets.length) throw new Error('세계사 데이터(data/world/*.js)를 불러오지 못했습니다');
+  if (!initGL()) return;
+  const byId = new Map(sets.map((d) => [d.meta.id, d]));
+  const data = byId.get(decodeURIComponent(location.hash.slice(1))) || sets[0];
+  $('dataset').replaceChildren(...sets.map((d) => new Option(d.meta.title, d.meta.id)));
+  $('dataset').value = data.meta.id;
+  $('dataset').addEventListener('change', (e) => { location.hash = e.target.value; location.reload(); });
+  loadData(data);
+  document.title = `${data.meta.title} · 세계사 연관도`;
+  $('title').textContent = data.meta.title;
+  $('subtitle').textContent = `인물 ${state.persons.size}명 · 사건 ${state.events.size}개 · ${data.meta.range[0]}–${data.meta.range[1]}`;
+  buildScene();
+  buildLabels();
+  // 범례
+  $('legendGroups').innerHTML = state.meta.groups.map((g) => `<li><i class="dot" style="background:${g.color};box-shadow:0 0 6px ${g.color}"></i>${esc(g.name)}</li>`).join('');
+  $('legendEvents').innerHTML = Object.values(state.meta.eventTypes).map((t) => `<li><i class="gem" style="background:${t.color}"></i>${esc(t.name)}</li>`).join('');
+  // 찾기
+  const all = [...[...state.persons.values()].map((p) => ({ k: 'p', id: p.id, label: `${p.ko} (${p.en})` })), ...[...state.events.values()].map((e) => ({ k: 'e', id: e.id, label: `${e.ko} (${e.from})` }))];
+  $('people').replaceChildren(...all.map((x) => { const o = document.createElement('option'); o.value = x.label; return o; }));
+  $('find').addEventListener('change', (ev) => {
+    const q = ev.target.value.trim().toLowerCase();
+    if (!q) return;
+    const hit = all.find((x) => x.label.toLowerCase() === q) || all.find((x) => x.label.toLowerCase().includes(q));
+    if (!hit) return;
+    select({ kind: hit.k, id: hit.id }, true);
+    ctl.radiusGoal = Math.min(ctl.radiusGoal, 70);
+    ev.target.value = ''; ev.target.blur();
+  });
+  // 표시 칩
+  for (const k of ['family', 'union', 'event', 'relation', 'era']) {
+    const el = $(`show_${k}`);
+    el.checked = state.show[k];
+    el.addEventListener('change', () => { state.show[k] = el.checked; dirty = true; });
+  }
+  $('timeFocus').addEventListener('change', (e) => { state.timeFocus = e.target.checked; dirty = true; });
+  $('follow').checked = state.follow;
+  $('follow').addEventListener('change', (e) => { state.follow = e.target.checked; });
+  $('autoRotate').checked = state.autoRotate;
+  $('autoRotate').addEventListener('change', (e) => { state.autoRotate = e.target.checked; });
+  $('toggleControls').addEventListener('click', () => {
+    const on = !document.body.classList.contains('controls-open');
+    document.body.classList.toggle('controls-open', on);
+    $('toggleControls').setAttribute('aria-expanded', String(on));
+  });
+  setupControls();
+  setupInfo();
+  setupTimebar();
+  setYear(1661, false);
+  window.addEventListener('resize', resize);
+  resize();
+  // 멀리서 시작해 중심 인물의 시대로 다가간다.
+  const S = state.persons.get(state.subject);
+  ctl.target.copy(toWorld(new T.Vector3(xOf(S.b + 20), 0, 0)));
+  ctl.radius = 420;
+  if (vertical) { ctl.theta = 0.45; ctl.phi = 1.5; }
+  fitRange(S.b - 12, S.d + 8);
+  if (!isNarrow()) select({ kind: 'p', id: state.subject }, false);
+  requestAnimationFrame(frame);
+  window.__world = { state, ctl, select, setYear, camera: () => camera, relationToSubject, pathFromSubject };
+}
+
+main();
+})();

@@ -225,16 +225,17 @@ test('출생 순서: 몇남 몇녀 중 몇째 (장남·차남·장녀·차녀)',
   assert.match(m.birthOrder(only).full, /^(외아들|외동딸)$/);
 });
 
-test('index.html·tree.html: 로컬 CSS·JS·데이터에 같은 캐시 버전(?v=)이 붙어 있음', () => {
+test('index.html·tree.html·world.html: 로컬 CSS·JS·데이터에 같은 캐시 버전(?v=)이 붙어 있음', () => {
   const all = new Set();
-  for (const page of ['index.html', 'tree.html']) {
+  const NEEDS = { 'index.html': DATA_FILES, 'tree.html': DATA_FILES, 'world.html': ['data/world/louis-xiv.js'] };
+  for (const page of Object.keys(NEEDS)) {
     const html = readFileSync(new URL(`../${page}`, import.meta.url), 'utf8');
     const refs = [...html.matchAll(/(?:src|href)="((?:css|js|data|vendor)\/[^"]+)"/g)].map((m) => m[1]);
     assert.ok(refs.length >= 8, `${page}: 로컬 자원 ${refs.length}개`);
     const versions = new Set(refs.map((r) => (r.match(/\?v=([^"&]+)/) || [])[1]));
     assert.ok(!versions.has(undefined), `${page}: 버전이 빠진 자원: ${refs.filter((r) => !r.includes('?v=')).join(', ')}`);
     for (const v of versions) all.add(v);
-    for (const f of DATA_FILES) assert.ok(refs.some((r) => r.startsWith(f + '?')), `${f}가 ${page}에 없음`);
+    for (const f of NEEDS[page]) assert.ok(refs.some((r) => r.startsWith(f + '?')), `${f}가 ${page}에 없음`);
     for (const r of refs) assert.ok(existsSync(new URL(`../${r.split('?')[0]}`, import.meta.url)), `${page}: 없는 파일 ${r}`);
   }
   assert.equal(all.size, 1, `버전이 서로 다름: ${[...all].join(', ')}`);
@@ -332,3 +333,39 @@ test('가상 가족: 인척과 사돈', () => {
 });
 
 function m(k) { return k.m; }
+
+// ── 세계사 연관도 데이터(data/world/*.js) ─────────────────────
+test('세계사 데이터: 참조가 맞고, 모든 인물이 다른 인물과 한 명 이상 이어져 있음', () => {
+  const ctx = { window: {} };
+  ctx.window = ctx;
+  vm.createContext(ctx);
+  vm.runInContext(readFileSync(new URL('../data/world/louis-xiv.js', import.meta.url), 'utf8'), ctx);
+  const d = ctx.WORLD_DATASETS[0];
+  const ids = new Set();
+  for (const p of d.persons) { assert.ok(!ids.has(p[0]), `중복 id ${p[0]}`); ids.add(p[0]); }
+  assert.ok(ids.has(d.meta.subject));
+  const groups = new Set(d.meta.groups.map((g) => g.id));
+  const deg = new Map([...ids].map((id) => [id, 0]));
+  const link = (a, b) => { deg.set(a, deg.get(a) + 1); deg.set(b, deg.get(b) + 1); };
+  for (const [id, , , b, dd, g, group, , f, m] of d.persons) {
+    assert.ok(b < dd && b >= d.meta.range[0] && dd <= d.meta.range[1], `${id} 생몰년 ${b}–${dd}`);
+    assert.ok(g === 'M' || g === 'F', `${id} 성별`);
+    assert.ok(groups.has(group), `${id} 분류 ${group}`);
+    for (const par of [f, m]) if (par) { assert.ok(ids.has(par), `${id}의 부모 ${par} 없음`); link(id, par); }
+  }
+  for (const [a, b, year, kind] of d.unions) {
+    assert.ok(ids.has(a) && ids.has(b), `혼인 ${a}–${b}`);
+    assert.ok(kind === 'm' || kind === 'l');
+    assert.ok(Number.isInteger(year));
+    link(a, b);
+  }
+  for (const [a, b] of d.relations) { assert.ok(ids.has(a) && ids.has(b), `관계 ${a}–${b}`); link(a, b); }
+  const lonely = [...deg].filter(([, n]) => n === 0).map(([id]) => id);
+  assert.deepEqual(lonely, [], `이어진 인물이 없는 사람: ${lonely.join(', ')}`);
+  for (const e of d.events) {
+    assert.ok(d.meta.eventTypes[e.type], `${e.id} 종류`);
+    assert.ok(e.from <= e.to, `${e.id} 기간`);
+    assert.ok(e.people.length >= 1, `${e.id} 관련 인물`);
+    for (const [pid] of e.people) assert.ok(ids.has(pid), `${e.id}의 인물 ${pid} 없음`);
+  }
+});
