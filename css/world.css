@@ -104,6 +104,7 @@ body.route-on .hud-top .controls:hover, body.route-on .hud-top .controls:focus-w
 .tb-main { flex: 1; min-width: 0; }
 .tb-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
 .tb-head b { font: 600 1.25rem var(--f-mono); color: var(--ink); letter-spacing: 0.04em; }
+.tb-head em { font: 500 0.72rem var(--f-body); font-style: normal; color: var(--ink-2); white-space: nowrap; }
 .tb-head span { font-size: 0.8rem; color: var(--c, var(--accent)); filter: brightness(1.4); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tb-track { position: relative; height: 22px; }
 .tb-track .bands { position: absolute; left: 0; right: 0; top: 9px; height: 5px; border-radius: 3px; overflow: hidden; opacity: 0.85; }

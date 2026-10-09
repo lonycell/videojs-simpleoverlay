@@ -255,6 +255,7 @@ function stepWord(st) {
 
 // ── 3D 장면 ──────────────────────────────────────────────
 let renderer, scene, camera, fx, post;
+let hits; // 연도 막과 생애선이 만나는 고리
 let beads, gems, lifelines, links, rings, pickLife, ticks, eraRings, cursor, axisBeam, sky, dust;
 // 휴대폰처럼 세로로 긴 화면에서는 시간 축을 세로로 세운다(위가 과거, 아래가 미래). 모든 장면 요소를 root에 담아 돌린다.
 let root, vertical = false;
@@ -373,13 +374,21 @@ function buildScene() {
     fragmentShader: `uniform float uTime, uVis; uniform vec3 uColor; varying vec2 vP;
       void main(){ float r = length(vP) / 40.0;
         float rim = smoothstep(0.94, 0.995, r) * (1.0 - smoothstep(0.995, 1.0, r));
-        float rings = smoothstep(0.48, 0.5, abs(fract(r * 8.0 - uTime * 0.25) - 0.5)) * 0.18;
-        float a = clamp((rim * 1.2 + rings * (1.0 - r) + 0.035) * uVis, 0.0, 1.0);
+        float rings = smoothstep(0.47, 0.5, abs(fract(r * 8.0 - uTime * 0.25) - 0.5)) * 0.22;
+        float ang = atan(vP.y, vP.x + 1e-4) / 6.2831 * 24.0;
+        float rays = (1.0 - smoothstep(0.0, 0.04, abs(fract(ang) - 0.5) - 0.46)) * smoothstep(0.15, 0.3, r) * 0.08;
+        // 표면에 시대 색을 옅게 입혀 평면이 보이게 한다(가운데가 조금 더 진하다).
+        float fill = 0.10 + 0.07 * (1.0 - r);
+        float a = clamp((rim * 1.2 + rings * (1.0 - r) + rays + fill) * uVis, 0.0, 1.0);
         gl_FragColor = vec4(uColor * a, a); }`,
   }));
   cursor.rotation.y = Math.PI / 2;
   cursor.renderOrder = 5;
   root.add(cursor);
+  // 연도 막에 걸린 인물: 생애선이 막을 지나는 자리에 그 사람 색의 빛나는 고리를 끼운다.
+  hits = fx.instanced(new T.TorusGeometry(1, 0.16, 10, 40), fx.ringMaterial(), state.persons.size, [['aColor', 3], ['aParams', 4]]);
+  hits.renderOrder = 6;
+  root.add(hits);
 
   // 인물: 구슬 + 생애선(관)
   beads = fx.instanced(new T.SphereGeometry(1, 40, 28), fx.sphereMaterial(), P.length, [['aColor', 3], ['aParams', 4]]);
@@ -1053,6 +1062,29 @@ function setupTimebar() {
   life.title = `${S.ko} ${S.b}–${S.d}`;
 }
 
+// 연도 막에 걸린 인물 고리(매 프레임: 막이 움직이는 동안에도 따라간다)
+const _hm = new T.Matrix4(), _hq = new T.Quaternion().setFromAxisAngle(new T.Vector3(0, 1, 0), Math.PI / 2), _hs = new T.Vector3(), _hp = new T.Vector3();
+function updateHits(vis) {
+  if (vis < 0.01) { hits.count = 0; return; }
+  const yNow = cursor.position.x / YS + X0;
+  const ac = hits.geometry.attributes.aColor, ap = hits.geometry.attributes.aParams;
+  let n = 0;
+  for (const p of state.persons.values()) {
+    if (!(p.b <= yNow && yNow <= p.d)) continue;
+    if (state.route && !state.route.ps.has(p.id)) continue;
+    const r = p.id === state.subject ? 1.6 : 0.85;
+    _hm.compose(_hp.set(cursor.position.x, p.y, p.z), _hq, _hs.set(r, r, r));
+    hits.setMatrixAt(n, _hm);
+    ac.setXYZ(n, p.color.r, p.color.g, p.color.b);
+    const sel = state.selected && state.selected.kind === 'p' && state.selected.id === p.id;
+    ap.setXYZW(n, vis * (sel ? 1.6 : 1), 0, 0, 0);
+    n++;
+  }
+  hits.count = n;
+  hits.instanceMatrix.needsUpdate = true; ac.needsUpdate = true; ap.needsUpdate = true;
+  $('aliveText').textContent = state.timeFocus ? `· 그해 살아 있던 인물 ${n}명` : '';
+}
+
 // ── 시작 ────────────────────────────────────────────────
 function resize() {
   const w = canvas.clientWidth || window.innerWidth, h = canvas.clientHeight || window.innerHeight;
@@ -1081,6 +1113,7 @@ function frame(now) {
   cv.value += ((state.timeFocus ? 1 : 0) - cv.value) * 0.1;
   cursor.visible = cv.value > 0.01;
   cursor.position.x += (xOf(state.year) - cursor.position.x) * 0.25;
+  updateHits(cv.value);
   cursor.material.uniforms.uColor.value.set(eraAt(state.year).color).lerp(new T.Color('#9fe8ff'), 0.4);
   updateCamera(dt);
   post.render();
