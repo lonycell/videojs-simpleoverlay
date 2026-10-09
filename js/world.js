@@ -37,7 +37,7 @@ const REL_KO = {
 const state = {
   data: null, meta: null, persons: new Map(), events: new Map(), subject: null,
   selected: null, hovered: null, // { kind: 'p'|'e', id }
-  year: 1661, timeFocus: false, follow: true, playing: false,
+  year: 1661, timeFocus: false, showPlane: true, follow: true, playing: false,
   show: { family: true, union: true, event: true, relation: true, era: true },
   autoRotate: false,
   lineK: 1, // 선 진하기(0.3~2): 평소 선의 투명도 배율
@@ -369,10 +369,10 @@ function buildScene() {
 
   // 연도 커서: 그 해를 지나는 둥근 빛의 막
   cursor = new T.Mesh(new T.CircleGeometry(40, 128), new T.ShaderMaterial({
-    uniforms: { uTime: fx.uTime, uColor: { value: col('#6fe6ff') }, uVis: { value: 0 } },
+    uniforms: { uTime: fx.uTime, uColor: { value: col('#6fe6ff') }, uVis: { value: 0 }, uPlane: { value: 1 } },
     transparent: true, depthWrite: false, blending: T.AdditiveBlending, side: T.DoubleSide,
     vertexShader: 'varying vec2 vP; void main(){ vP = position.xy; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
-    fragmentShader: `uniform float uTime, uVis; uniform vec3 uColor; varying vec2 vP;
+    fragmentShader: `uniform float uTime, uVis, uPlane; uniform vec3 uColor; varying vec2 vP;
       void main(){ float r = length(vP) / 40.0;
         float rim = smoothstep(0.94, 0.995, r) * (1.0 - smoothstep(0.995, 1.0, r));
         float rings = smoothstep(0.47, 0.5, abs(fract(r * 8.0 - uTime * 0.25) - 0.5)) * 0.22;
@@ -380,7 +380,7 @@ function buildScene() {
         float rays = (1.0 - smoothstep(0.0, 0.04, abs(fract(ang) - 0.5) - 0.46)) * smoothstep(0.15, 0.3, r) * 0.08;
         // 표면에 시대 색을 옅게 입혀 평면이 보이게 한다(가운데가 조금 더 진하다).
         float fill = 0.10 + 0.07 * (1.0 - r);
-        float a = clamp((rim * 1.2 + rings * (1.0 - r) + rays + fill) * uVis, 0.0, 1.0);
+        float a = clamp((rim * 1.2 + rings * (1.0 - r) + rays + fill) * uVis * uPlane, 0.0, 1.0);
         gl_FragColor = vec4(uColor * a, a); }`,
   }));
   cursor.rotation.y = Math.PI / 2;
@@ -1022,7 +1022,7 @@ function setYear(y, focus) {
   $('timebar').style.setProperty('--c', era.color);
   $('timeFocus').checked = state.timeFocus;
   // 시간 따라가기: 카메라를 매번 가운데로 옮기지 않고, 막이 화면 가장자리에 다가갈 때만 장면을 민다(keepCursorInView).
-  if (focus) cursorMovedAt = clock;
+  if (focus) cursorMovedAt = performance.now() / 1000; // 실제 시각(느린 기기에서 clock은 늦게 흐른다)
   dirty = true;
 }
 function setupTimebar() {
@@ -1102,7 +1102,7 @@ function cursorBounds() {
   return hi - lo > 0.4 ? [lo, hi] : [-1, 1];
 }
 function keepCursorInView(dt) {
-  if (!state.follow || !state.timeFocus || clock - cursorMovedAt > 2.5) return;
+  if (!state.follow || !state.timeFocus || performance.now() / 1000 - cursorMovedAt > 2.5) return;
   camera.updateMatrixWorld();
   const target = new T.Vector3(xOf(state.year), 0, 0); // 막이 가 있을 자리(움직이는 중이어도 목표 기준)
   _cv.copy(toWorld(target)).project(camera);
@@ -1138,6 +1138,7 @@ function frame(now) {
   requestAnimationFrame(frame);
   if (document.hidden) { last = now; return; }
   const dt = Math.min(1 / 30, (now - last) / 1000);
+  const realDt = Math.min(0.25, (now - last) / 1000);
   last = now;
   clock += dt;
   fx.uTime.value = clock;
@@ -1149,7 +1150,11 @@ function frame(now) {
   if (dirty) refresh();
   const cv = cursor.material.uniforms.uVis;
   cv.value += ((state.timeFocus ? 1 : 0) - cv.value) * 0.1;
-  cursor.visible = cv.value > 0.01;
+  // 시대 판(막의 원판)은 끌 수 있다. 꺼 두어도 연도를 옮기거나 재생하는 동안에는 보였다가 잠시 뒤 사라진다.
+  const pv = cursor.material.uniforms.uPlane;
+  const planeOn = state.showPlane || state.playing || now / 1000 - cursorMovedAt < 1.5;
+  pv.value += ((planeOn ? 1 : 0) - pv.value) * (1 - Math.exp(-realDt * (planeOn ? 14 : 5))); // 시간 기준(약 0.6초에 사라짐)
+  cursor.visible = cv.value * pv.value > 0.01;
   cursor.position.x += (xOf(state.year) - cursor.position.x) * 0.25;
   updateBeads(cv.value, dt);
   cursor.material.uniforms.uColor.value.set(eraAt(state.year).color).lerp(new T.Color('#9fe8ff'), 0.4);
@@ -1197,6 +1202,12 @@ function main() {
     el.addEventListener('change', () => { state.show[k] = el.checked; dirty = true; });
   }
   $('timeFocus').addEventListener('change', (e) => { state.timeFocus = e.target.checked; dirty = true; });
+  try { state.showPlane = localStorage.getItem('genealogy.world.plane') !== '0'; } catch (err) { /* 기본값 */ }
+  $('showPlane').checked = state.showPlane;
+  $('showPlane').addEventListener('change', (e) => {
+    state.showPlane = e.target.checked;
+    try { localStorage.setItem('genealogy.world.plane', state.showPlane ? '1' : '0'); } catch (err) { /* 저장 불가: 무시 */ }
+  });
   $('follow').checked = state.follow;
   $('follow').addEventListener('change', (e) => { state.follow = e.target.checked; });
   try { const k = parseFloat(localStorage.getItem('genealogy.world.lineK')); if (k >= 0.3 && k <= 2) state.lineK = k; } catch (err) { /* 기본값 */ }
@@ -1239,7 +1250,7 @@ function main() {
   else fitRange(S.b - 12, S.d + 8);
   if (!isNarrow()) select({ kind: 'p', id: state.subject }, false);
   requestAnimationFrame(frame);
-  window.__world = { state, ctl, select, setYear, setRoute, camera: () => camera, cursorNdc: () => { const v = toWorld(new T.Vector3(xOf(state.year), 0, 0)).project(camera); return +(vertical ? -v.y : v.x).toFixed(2); }, relationToSubject, pathFromSubject, routeTo };
+  window.__world = { state, ctl, select, setYear, setRoute, camera: () => camera, plane: () => +cursor.material.uniforms.uPlane.value.toFixed(2), cursorNdc: () => { const v = toWorld(new T.Vector3(xOf(state.year), 0, 0)).project(camera); return +(vertical ? -v.y : v.x).toFixed(2); }, relationToSubject, pathFromSubject, routeTo };
 }
 
 main();

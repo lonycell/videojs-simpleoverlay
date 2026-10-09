@@ -8,9 +8,9 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@500;700&family=IBM+Plex+Sans+KR:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
-<link rel="stylesheet" href="css/bubble.css?v=20261009-7">
-<link rel="stylesheet" href="css/world.css?v=20261009-7">
-<link rel="stylesheet" href="css/nav.css?v=20261009-7">
+<link rel="stylesheet" href="css/bubble.css?v=20261009-8">
+<link rel="stylesheet" href="css/world.css?v=20261009-8">
+<link rel="stylesheet" href="css/nav.css?v=20261009-8">
 </head>
 <body class="world">
 <main class="space" id="space" aria-label="세계사 인물·사건 3D 연관도">
@@ -50,6 +50,7 @@
       <div class="chips" role="group" aria-label="시간">
         <label class="chip"><input type="checkbox" id="show_era" checked><span>시대 띠</span></label>
         <label class="chip" title="커서가 가리키는 해에 살아 있던 인물과 그 무렵의 사건만 밝게"><input type="checkbox" id="timeFocus"><span>그 해만 강조</span></label>
+        <label class="chip" title="연도 막의 원판. 꺼 두어도 연도를 옮기거나 재생하는 동안에는 잠깐 보임"><input type="checkbox" id="showPlane" checked><span>시대 판</span></label>
         <label class="chip" title="연도를 바꾸면 카메라가 그 해로 따라감"><input type="checkbox" id="follow" checked><span>시간 따라가기</span></label>
         <label class="chip"><input type="checkbox" id="autoRotate"><span>자동 회전</span></label>
       </div>
@@ -104,10 +105,10 @@
   </div>
 </main>
 <!-- 서버 없이 바로 열어도 되도록 모두 일반 스크립트. ?v=는 다른 페이지와 같은 캐시 무효화 버전(테스트가 확인). -->
-<script src="vendor/three.min.js?v=20261009-7"></script>
-<script src="data/world/louis-xiv.js?v=20261009-7"></script>
-<script src="js/nav.js?v=20261009-7"></script>
-<script src="js/fx3d.js?v=20261009-7"></script>
-<script src="js/world.js?v=20261009-7"></script>
+<script src="vendor/three.min.js?v=20261009-8"></script>
+<script src="data/world/louis-xiv.js?v=20261009-8"></script>
+<script src="js/nav.js?v=20261009-8"></script>
+<script src="js/fx3d.js?v=20261009-8"></script>
+<script src="js/world.js?v=20261009-8"></script>
 </body>
 </html>
