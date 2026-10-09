@@ -370,7 +370,7 @@ function buildScene() {
   // 연도 커서: 그 해를 지나는 둥근 빛의 막
   cursor = new T.Mesh(new T.CircleGeometry(40, 128), new T.ShaderMaterial({
     uniforms: { uTime: fx.uTime, uColor: { value: col('#6fe6ff') }, uVis: { value: 0 }, uPlane: { value: 1 } },
-    transparent: true, depthWrite: false, blending: T.AdditiveBlending, side: T.DoubleSide,
+    transparent: true, depthWrite: false, side: T.DoubleSide,
     vertexShader: 'varying vec2 vP; void main(){ vP = position.xy; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
     fragmentShader: `uniform float uTime, uVis, uPlane; uniform vec3 uColor; varying vec2 vP;
       void main(){ float r = length(vP) / 40.0;
@@ -378,10 +378,11 @@ function buildScene() {
         float rings = smoothstep(0.47, 0.5, abs(fract(r * 8.0 - uTime * 0.25) - 0.5)) * 0.22;
         float ang = atan(vP.y, vP.x + 1e-4) / 6.2831 * 24.0;
         float rays = (1.0 - smoothstep(0.0, 0.04, abs(fract(ang) - 0.5) - 0.46)) * smoothstep(0.15, 0.3, r) * 0.08;
-        // 표면에 시대 색을 옅게 입혀 평면이 보이게 한다(가운데가 조금 더 진하다).
-        float fill = 0.10 + 0.07 * (1.0 - r);
-        float a = clamp((rim * 1.2 + rings * (1.0 - r) + rays + fill) * uVis * uPlane, 0.0, 1.0);
-        gl_FragColor = vec4(uColor * a, a); }`,
+        // 판은 거의 불투명한 어두운 면(시대 색을 살짝 입힘)이라 그 뒤쪽은 가려져 복잡하지 않다.
+        vec3 base = mix(vec3(0.002, 0.003, 0.007), uColor, 0.025 + 0.02 * (1.0 - r)); // 선형 색: 화면에서는 이보다 꽤 밝게 보인다
+        vec3 glow = uColor * (rim * 1.4 + (rings * (1.0 - r) + rays) * 0.5);
+        float a = clamp(0.94 * uVis * uPlane, 0.0, 1.0);
+        gl_FragColor = vec4(base + glow, a); }`,
   }));
   cursor.rotation.y = Math.PI / 2;
   cursor.renderOrder = 5;
@@ -893,11 +894,21 @@ function updateLabels() {
   const sel = state.selected, hov = state.hovered;
   const rel = relatedSets();
   const items = [];
+  // 시대 판이 보이면 카메라에서 볼 때 판 뒤에 있는 이름표도 숨긴다.
+  const planeOn = cursor.visible && cursor.material.depthWrite;
+  const camL = planeOn ? toLocal(cam) : null, px = cursor.position.x;
+  const behindPlane = (pos) => {
+    if (!planeOn || (camL.x - px) * (pos.x - px) >= 0) return false;
+    const t = (px - camL.x) / (pos.x - camL.x);
+    const y = camL.y + t * (pos.y - camL.y), z = camL.z + t * (pos.z - camL.z);
+    return y * y + z * z < 40 * 40;
+  };
   for (const L of labels) {
     if (L.kind === 'era') { L.el.style.display = state.show.era ? '' : 'none'; if (!state.show.era) continue; }
     if (L.kind === 'e' && !state.show.event && !(state.route && state.route.event === L.obj.id)) { L.el.style.opacity = '0'; continue; }
     if (state.route && (L.kind === 'p' || L.kind === 'e') && !(L.kind === 'p' ? state.route.ps.has(L.obj.id) : state.route.event === L.obj.id)) { L.el.style.opacity = '0'; continue; }
     if (state.route && L.kind === 'g') { L.el.style.opacity = '0'; continue; }
+    if (L.kind !== 'era' && behindPlane(L.pos) && !(sel && L.obj && sel.id === L.obj.id)) { L.el.style.opacity = '0'; continue; }
     const dist = cam.distanceTo(vertical ? toWorld(L.pos) : L.pos);
     let pri = L.base;
     if (L.kind === 'p' || L.kind === 'e') {
@@ -1155,6 +1166,8 @@ function frame(now) {
   const planeOn = state.showPlane || state.playing || now / 1000 - cursorMovedAt < 1.5;
   pv.value += ((planeOn ? 1 : 0) - pv.value) * (1 - Math.exp(-realDt * (planeOn ? 14 : 5))); // 시간 기준(약 0.6초에 사라짐)
   cursor.visible = cv.value * pv.value > 0.01;
+  // 충분히 보일 때만 깊이를 써서 판 뒤의 선·구슬을 가린다(사라지는 중에 보이지 않는 벽이 남지 않게).
+  cursor.material.depthWrite = cv.value * pv.value > 0.6;
   cursor.position.x += (xOf(state.year) - cursor.position.x) * 0.25;
   updateBeads(cv.value, dt);
   cursor.material.uniforms.uColor.value.set(eraAt(state.year).color).lerp(new T.Color('#9fe8ff'), 0.4);
