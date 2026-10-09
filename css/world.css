@@ -63,6 +63,9 @@
 .go:hover, .go:focus-visible { background: color-mix(in srgb, var(--c) 16%, transparent); outline: none; }
 .world-info .acts a.glass-btn { display: inline-flex; align-items: center; text-decoration: none; }
 
+/* 설정의 선 진하기 막대 */
+.field.range input[type=range] { width: 120px; height: 32px; padding: 0; border: 0; background: transparent; accent-color: var(--accent); cursor: pointer; }
+
 /* 경로만 보기 막대 */
 .route-bar {
   position: absolute; left: 50%; top: 92px; z-index: 6; transform: translateX(-50%);
