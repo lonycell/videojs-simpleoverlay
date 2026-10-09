@@ -7,6 +7,7 @@
   const PAGES = [
     { id: 'bubble', href: 'index.html', title: '버블 가계도', desc: '3D 구슬로 보는 자손의 관계망 (첫 화면)' },
     { id: 'tree', href: 'tree.html', title: '가계도', desc: '카드로 보는 계보도 · 호칭과 촌수' },
+    { id: 'world', href: 'world.html', title: '세계사 연관도', desc: '외국 역사 인물과 사건을 시간 축 위 3D로' },
   ];
   const ROOT = '역사 인물 가계도';
 
@@ -58,7 +59,7 @@
       a.querySelector('b').textContent = p.title;
       a.querySelector('span').textContent = p.desc;
       // 지금 보는 가계도를 이어서 연다.
-      a.addEventListener('click', () => { a.href = p.href + location.hash; });
+      a.addEventListener('click', () => { a.href = p.href + (p.id === 'world' || current.id === 'world' ? '' : location.hash); });
       li.append(a);
       menu.append(li);
       return a;
