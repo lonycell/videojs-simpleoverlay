@@ -100,6 +100,8 @@ function layout() {
     p.y = p.radius * Math.sin(p.angle);
     p.z = p.radius * Math.cos(p.angle);
     p.bead = new T.Vector3(xOf((p.b + p.d) / 2), p.y, p.z);
+    p.beadNow = p.bead.clone(); // 실제로 그리는 자리(연도 막에 걸리면 막 쪽으로 미끄러진다)
+    p.onPlane = 0;
   }
   // 사건 레일: 시기가 겹치면 레일 둘레로 비켜 놓는다.
   const evs = [...state.events.values()].sort((a, b) => a.from - b.from);
@@ -255,7 +257,6 @@ function stepWord(st) {
 
 // ── 3D 장면 ──────────────────────────────────────────────
 let renderer, scene, camera, fx, post;
-let hits; // 연도 막과 생애선이 만나는 고리
 let beads, gems, lifelines, links, rings, pickLife, ticks, eraRings, cursor, axisBeam, sky, dust;
 // 휴대폰처럼 세로로 긴 화면에서는 시간 축을 세로로 세운다(위가 과거, 아래가 미래). 모든 장면 요소를 root에 담아 돌린다.
 let root, vertical = false;
@@ -385,10 +386,6 @@ function buildScene() {
   cursor.rotation.y = Math.PI / 2;
   cursor.renderOrder = 5;
   root.add(cursor);
-  // 연도 막에 걸린 인물: 생애선이 막을 지나는 자리에 그 사람 색의 빛나는 고리를 끼운다.
-  hits = fx.instanced(new T.TorusGeometry(1, 0.16, 10, 40), fx.ringMaterial(), state.persons.size, [['aColor', 3], ['aParams', 4]]);
-  hits.renderOrder = 6;
-  root.add(hits);
 
   // 인물: 구슬 + 생애선(관)
   beads = fx.instanced(new T.SphereGeometry(1, 40, 28), fx.sphereMaterial(), P.length, [['aColor', 3], ['aParams', 4]]);
@@ -409,7 +406,6 @@ function buildScene() {
     pickLife.setMatrixAt(i, _m);
   });
   beads.count = P.length;
-  baseM.beads = Float32Array.from(beads.instanceMatrix.array);
   root.add(beads, pickLife);
 
   // 사건: 수정 + 축을 감싸는 고리
@@ -649,7 +645,6 @@ function refresh() {
     mesh.instanceMatrix.needsUpdate = true;
   };
   const PL = [...state.persons.values()], EL = [...state.events.values()];
-  hideOut(beads, baseM.beads, PL, (p) => R.ps.has(p.id));
   hideOut(gems, baseM.gems, EL, (e) => R.event === e.id);
   hideOut(rings, baseM.rings, EL, (e) => R.event === e.id);
   dirty = false;
@@ -816,7 +811,7 @@ function select(sel, fly) {
   if (onRoute) fly = false;
   renderInfo();
   if (sel && fly) {
-    if (sel.kind === 'p') { const p = state.persons.get(sel.id); flyTo(new T.Vector3(p.bead.x, p.y * 0.5, p.z * 0.5)); }
+    if (sel.kind === 'p') { const p = state.persons.get(sel.id); flyTo(new T.Vector3(p.beadNow.x, p.y * 0.5, p.z * 0.5)); }
     else { const e = state.events.get(sel.id); flyTo(e.pos); setYear(e.from, false); }
   }
 }
@@ -852,7 +847,7 @@ function buildLabels() {
     el.style.setProperty('--c', '#' + p.color.getHexString(T.SRGBColorSpace));
     el.innerHTML = `<b>${esc(p.ko)}</b><span>${p.b}–${p.d}</span>`;
     labelBox.append(el);
-    labels.push({ kind: 'p', obj: p, el, pos: p.bead, base: p.id === state.subject ? 140 : 20 + (p.events.length + p.kids.length) * 2 });
+    labels.push({ kind: 'p', obj: p, el, pos: p.beadNow, base: p.id === state.subject ? 140 : 20 + (p.events.length + p.kids.length) * 2 });
   }
   for (const e of state.events.values()) {
     const el = document.createElement('div');
@@ -1062,26 +1057,33 @@ function setupTimebar() {
   life.title = `${S.ko} ${S.b}–${S.d}`;
 }
 
-// 연도 막에 걸린 인물 고리(매 프레임: 막이 움직이는 동안에도 따라간다)
-const _hm = new T.Matrix4(), _hq = new T.Quaternion().setFromAxisAngle(new T.Vector3(0, 1, 0), Math.PI / 2), _hs = new T.Vector3(), _hp = new T.Vector3();
-function updateHits(vis) {
-  if (vis < 0.01) { hits.count = 0; return; }
+// 연도 막에 걸린 구슬: 그해 살아 있는 인물의 구슬이 생애선을 따라 막과 만나는 자리로 미끄러져 와
+// 막 위에 걸리고, 조금 커지며 맥동하듯 빛난다. 강조를 끄면 생애 가운데의 제자리로 돌아간다(매 프레임).
+const _bm = new T.Matrix4(), _bq = new T.Quaternion(), _bs = new T.Vector3(), _bt = new T.Vector3();
+function updateBeads(vis, dt) {
   const yNow = cursor.position.x / YS + X0;
-  const ac = hits.geometry.attributes.aColor, ap = hits.geometry.attributes.aParams;
+  const k = 1 - Math.exp(-dt * 7);
+  const sp = beads.geometry.attributes.aParams;
   let n = 0;
   for (const p of state.persons.values()) {
-    if (!(p.b <= yNow && yNow <= p.d)) continue;
-    if (state.route && !state.route.ps.has(p.id)) continue;
-    const r = p.id === state.subject ? 1.6 : 0.85;
-    _hm.compose(_hp.set(cursor.position.x, p.y, p.z), _hq, _hs.set(r, r, r));
-    hits.setMatrixAt(n, _hm);
-    ac.setXYZ(n, p.color.r, p.color.g, p.color.b);
-    const sel = state.selected && state.selected.kind === 'p' && state.selected.id === p.id;
-    ap.setXYZW(n, vis * (sel ? 1.6 : 1), 0, 0, 0);
-    n++;
+    const hidden = state.route && !state.route.ps.has(p.id);
+    const caught = vis > 0.01 && p.b <= yNow && yNow <= p.d && !hidden;
+    if (caught) n++;
+    p.onPlane += ((caught ? 1 : 0) - p.onPlane) * k;
+    if (caught) _bt.set(cursor.position.x, p.y, p.z); else _bt.copy(p.bead);
+    p.beadNow.lerp(_bt, caught ? Math.min(1, k * 2.2) : k);
+    const base = p.id === state.subject ? 2.0 : 0.95;
+    const pulse = 1 + 0.06 * Math.sin(clock * 5 + p.index) * p.onPlane;
+    const r = hidden ? 0 : base * (1 + 0.32 * p.onPlane) * pulse;
+    _bm.compose(p.beadNow, _bq, _bs.set(r, r, r));
+    beads.setMatrixAt(p.index, _bm);
+    // 걸린 구슬은 강조 빛을 더한다(선택·마우스 강조가 있으면 그쪽이 우선).
+    const hl = sp.getY(p.index);
+    if (hl < 0.8) sp.setY(p.index, 0.55 * p.onPlane * (0.75 + 0.25 * Math.sin(clock * 4 + p.index)));
   }
-  hits.count = n;
-  hits.instanceMatrix.needsUpdate = true; ac.needsUpdate = true; ap.needsUpdate = true;
+  beads.instanceMatrix.needsUpdate = true;
+  sp.needsUpdate = true;
+  beads.boundingSphere = null;
   $('aliveText').textContent = state.timeFocus ? `· 그해 살아 있던 인물 ${n}명` : '';
 }
 
@@ -1113,7 +1115,7 @@ function frame(now) {
   cv.value += ((state.timeFocus ? 1 : 0) - cv.value) * 0.1;
   cursor.visible = cv.value > 0.01;
   cursor.position.x += (xOf(state.year) - cursor.position.x) * 0.25;
-  updateHits(cv.value);
+  updateBeads(cv.value, dt);
   cursor.material.uniforms.uColor.value.set(eraAt(state.year).color).lerp(new T.Color('#9fe8ff'), 0.4);
   updateCamera(dt);
   post.render();
