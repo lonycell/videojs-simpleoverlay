@@ -1021,10 +1021,8 @@ function setYear(y, focus) {
   $('eraText').textContent = era.name;
   $('timebar').style.setProperty('--c', era.color);
   $('timeFocus').checked = state.timeFocus;
-  if (state.follow && focus) {
-    const g = toLocal(ctl.goal || ctl.target);
-    flyTo(new T.Vector3(xOf(state.year), g.y, g.z));
-  }
+  // 시간 따라가기: 카메라를 매번 가운데로 옮기지 않고, 막이 화면 가장자리에 다가갈 때만 장면을 민다(keepCursorInView).
+  if (focus) cursorMovedAt = clock;
   dirty = true;
 }
 function setupTimebar() {
@@ -1087,6 +1085,44 @@ function updateBeads(vis, dt) {
   $('aliveText').textContent = state.timeFocus ? `· 그해 살아 있던 인물 ${n}명` : '';
 }
 
+// 연도 막을 화면 안에 붙잡아 둔다. 막이 가장자리 쪽 안전 구역(화면 길이의 15%)을 넘어가려 하면
+// 막은 그 자리에 두고 카메라(장면)를 시간 방향으로 밀어 막이 화면 밖으로 나가지 않게 한다.
+// 연도를 바꾸는 중(막이 움직인 뒤 잠시)에만 동작해, 사용자가 카메라를 돌려 볼 때는 방해하지 않는다.
+let cursorMovedAt = -10;
+const SAFE = 0.15; // 보이는 영역 양 끝에서 이만큼(비율) 안쪽에 막이 머문다
+const _cv = new T.Vector3();
+// 시간 방향으로 막이 보이는 범위(정규화 화면 좌표 -1~1). 세로형에서는 위 제목과 아래 타임바에 가리는 곳을 뺀다.
+function cursorBounds() {
+  if (!vertical) return [-1, 1];
+  const r = canvas.getBoundingClientRect();
+  const h = r.height || 1;
+  const top = document.querySelector('.hud-top .brand')?.getBoundingClientRect().bottom ?? r.top;
+  const bottom = $('timebar').getBoundingClientRect().top;
+  const lo = (2 * (top - r.top)) / h - 1, hi = (2 * (bottom - r.top)) / h - 1;
+  return hi - lo > 0.4 ? [lo, hi] : [-1, 1];
+}
+function keepCursorInView(dt) {
+  if (!state.follow || !state.timeFocus || clock - cursorMovedAt > 2.5) return;
+  camera.updateMatrixWorld();
+  const target = new T.Vector3(xOf(state.year), 0, 0); // 막이 가 있을 자리(움직이는 중이어도 목표 기준)
+  _cv.copy(toWorld(target)).project(camera);
+  const along = vertical ? -_cv.y : _cv.x; // 시간이 흐르는 화면 방향의 좌표(뒤로 갈수록 +)
+  const behind = _cv.z > 1;
+  const [lo0, hi0] = cursorBounds();
+  const pad = (hi0 - lo0) * SAFE, lo = lo0 + pad, hi = hi0 - pad;
+  let over = 0;
+  if (behind) over = along > 0 ? 1 : -1;
+  else if (along > hi) over = along - hi;
+  else if (along < lo) over = along - lo;
+  if (!over) return;
+  // 화면 반 폭(또는 반 높이)이 몇 단위인지로 넘친 만큼을 시간 축 거리로 바꿔 민다.
+  const half = ctl.radius * Math.tan((camera.fov * Math.PI) / 360) * (vertical ? 1 : camera.aspect);
+  const dir = toWorld(new T.Vector3(1, 0, 0)).sub(toWorld(new T.Vector3(0, 0, 0))).normalize();
+  const shift = over * half * Math.min(1, dt * 12);
+  ctl.target.addScaledVector(dir, shift);
+  if (ctl.goal) ctl.goal.addScaledVector(dir, shift);
+}
+
 // ── 시작 ────────────────────────────────────────────────
 function resize() {
   const w = canvas.clientWidth || window.innerWidth, h = canvas.clientHeight || window.innerHeight;
@@ -1117,6 +1153,7 @@ function frame(now) {
   cursor.position.x += (xOf(state.year) - cursor.position.x) * 0.25;
   updateBeads(cv.value, dt);
   cursor.material.uniforms.uColor.value.set(eraAt(state.year).color).lerp(new T.Color('#9fe8ff'), 0.4);
+  keepCursorInView(dt);
   updateCamera(dt);
   post.render();
   updateLabels();
@@ -1202,7 +1239,7 @@ function main() {
   else fitRange(S.b - 12, S.d + 8);
   if (!isNarrow()) select({ kind: 'p', id: state.subject }, false);
   requestAnimationFrame(frame);
-  window.__world = { state, ctl, select, setYear, setRoute, camera: () => camera, relationToSubject, pathFromSubject, routeTo };
+  window.__world = { state, ctl, select, setYear, setRoute, camera: () => camera, cursorNdc: () => { const v = toWorld(new T.Vector3(xOf(state.year), 0, 0)).project(camera); return +(vertical ? -v.y : v.x).toFixed(2); }, relationToSubject, pathFromSubject, routeTo };
 }
 
 main();
