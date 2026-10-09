@@ -40,6 +40,7 @@ const state = {
   year: 1661, timeFocus: false, follow: true, playing: false,
   show: { family: true, union: true, event: true, relation: true, era: true },
   autoRotate: false,
+  lineK: 1, // 선 진하기(0.3~2): 평소 선의 투명도 배율
   orient: 'auto', // 시간 방향: auto(휴대폰 세로 화면은 세로) | h(가로, 왼쪽→오른쪽) | v(세로, 위→아래)
   route: null, // 경로만 보기: { ids, steps, ps:Set, pairs:Set, event }
 };
@@ -429,28 +430,28 @@ function buildScene() {
   for (const p of P) {
     // 생애선
     add('life', { k: 'p', id: p.id }, null, new T.Vector3(xOf(p.b), p.y, p.z), new T.Vector3(xOf(p.d), p.y, p.z), p.color, p.color,
-      { width: p.id === state.subject ? 0.34 : 0.15, straight: true, n: 1 });
+      { width: p.id === state.subject ? 0.22 : 0.065, straight: true, n: 1 });
     for (const par of [p.f, p.m]) {
       if (!par) continue;
       const q = persons.get(par);
-      add('family', { k: 'p', id: par }, { k: 'p', id: p.id }, pointOn(q, p.b), new T.Vector3(xOf(p.b), p.y, p.z), q.color, p.color, { width: 0.07, n: 10 });
+      add('family', { k: 'p', id: par }, { k: 'p', id: p.id }, pointOn(q, p.b), new T.Vector3(xOf(p.b), p.y, p.z), q.color, p.color, { width: 0.035, n: 10 });
     }
   }
   for (const [a, b, year, kind] of state.data.unions) {
     const A = persons.get(a), B = persons.get(b);
     add(kind === 'l' ? 'liaison' : 'union', { k: 'p', id: a }, { k: 'p', id: b }, pointOn(A, year), pointOn(B, year),
-      col(LINK_COLORS[kind === 'l' ? 'liaison' : 'union']), col(LINK_COLORS[kind === 'l' ? 'liaison' : 'union']), { width: kind === 'l' ? 0.05 : 0.08, n: 8 });
+      col(LINK_COLORS[kind === 'l' ? 'liaison' : 'union']), col(LINK_COLORS[kind === 'l' ? 'liaison' : 'union']), { width: kind === 'l' ? 0.025 : 0.04, n: 8 });
   }
   for (const [a, b] of state.data.relations) {
     const A = persons.get(a), B = persons.get(b);
     const y = (Math.max(A.b, B.b) + Math.min(A.d, B.d)) / 2;
-    add('relation', { k: 'p', id: a }, { k: 'p', id: b }, pointOn(A, y), pointOn(B, y), col(LINK_COLORS.relation), col(LINK_COLORS.relation), { width: 0.04, n: 8 });
+    add('relation', { k: 'p', id: a }, { k: 'p', id: b }, pointOn(A, y), pointOn(B, y), col(LINK_COLORS.relation), col(LINK_COLORS.relation), { width: 0.022, n: 8 });
   }
   for (const e of E) {
-    if (e.to > e.from) add('duration', { k: 'e', id: e.id }, null, e.pos.clone(), new T.Vector3(xOf(e.to + 0.6), e.y, e.z), e.color, e.color, { width: 0.22, straight: true, n: 1 });
+    if (e.to > e.from) add('duration', { k: 'e', id: e.id }, null, e.pos.clone(), new T.Vector3(xOf(e.to + 0.6), e.y, e.z), e.color, e.color, { width: 0.12, straight: true, n: 1 });
     for (const [pid] of e.people) {
       const p = persons.get(pid);
-      add('event', { k: 'e', id: e.id }, { k: 'p', id: pid }, e.pos.clone(), pointOn(p, e.from), e.color, p.color, { width: 0.045, n: 6 });
+      add('event', { k: 'e', id: e.id }, { k: 'p', id: pid }, e.pos.clone(), pointOn(p, e.from), e.color, p.color, { width: 0.022, n: 6 });
     }
   }
   const total = linkList.reduce((s, l) => s + l.n, 0);
@@ -621,9 +622,12 @@ function refresh() {
     if (L.kind === 'duration' && !state.show.event) v = 0;
     let hot = 0;
     if ((state.selected || R) && v > 0.9 && L.kind !== 'life') hot = 1;
-    const base = { life: [0.7, 0.12, 0.3], family: [0.9, 0.35, 0.5], union: [0.9, 0.2, 0.4], liaison: [0.6, 0.2, 0.2], relation: [0.55, 0.25, 0.15], event: [0.6, 0.45, 0.3], duration: [1.0, 0.4, 0.8] }[L.kind];
+    // [세기, 흐름 속도, 빛 알갱이, 평소 투명도]. 직선이 많은 생애선·사건선은 특히 옅게 둔다.
+    const base = { life: [0.5, 0.1, 0.12, 0.45], family: [0.75, 0.35, 0.35, 0.6], union: [0.75, 0.2, 0.3, 0.6], liaison: [0.5, 0.2, 0.15, 0.4], relation: [0.45, 0.25, 0.1, 0.35], event: [0.45, 0.45, 0.15, 0.28], duration: [0.8, 0.4, 0.5, 0.7] }[L.kind];
+    const K = state.lineK;
+    const alpha = Math.min(1, (hot ? 1.2 : base[3] * K) * v);
     for (let k = 0; k < L.n; k++) {
-      lp.setXYZW(L.start + k, base[0] * (0.4 + 0.6 * v), base[1], hot ? 1 : base[2], v * (L.kind === 'life' ? 0.9 : 1) * (hot ? 1.3 : 1));
+      lp.setXYZW(L.start + k, base[0] * (0.4 + 0.6 * v) * (hot ? 1.3 : Math.min(1.3, 0.6 + 0.4 * K)), base[1], hot ? 1 : base[2], alpha);
     }
   }
   lp.needsUpdate = true;
@@ -1123,6 +1127,13 @@ function main() {
   $('timeFocus').addEventListener('change', (e) => { state.timeFocus = e.target.checked; dirty = true; });
   $('follow').checked = state.follow;
   $('follow').addEventListener('change', (e) => { state.follow = e.target.checked; });
+  try { const k = parseFloat(localStorage.getItem('genealogy.world.lineK')); if (k >= 0.3 && k <= 2) state.lineK = k; } catch (err) { /* 기본값 */ }
+  $('lineK').value = state.lineK;
+  $('lineK').addEventListener('input', (e) => {
+    state.lineK = +e.target.value;
+    try { localStorage.setItem('genealogy.world.lineK', String(state.lineK)); } catch (err) { /* 저장 불가: 무시 */ }
+    dirty = true;
+  });
   $('orient').value = state.orient;
   $('orient').addEventListener('change', (e) => {
     state.orient = e.target.value;
